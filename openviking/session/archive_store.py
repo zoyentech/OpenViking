@@ -215,16 +215,14 @@ class ArchiveStore:
                 continue
         return "pending"
 
-    async def list_refs(self, *, strict: bool = False) -> List[Dict[str, Any]]:
+    async def list_refs(self) -> List[Dict[str, Any]]:
         """List archive refs sorted by archive index descending."""
         if not self._viking_fs:
             return []
 
         try:
             history_items = await self._viking_fs.ls(f"{self._session_uri}/history", ctx=self._ctx)
-        except Exception as exc:
-            if strict and not is_storage_not_found(exc):
-                raise
+        except Exception:
             return []
 
         refs: List[Dict[str, Any]] = []
@@ -438,6 +436,18 @@ class ArchiveStore:
                 raise _ArchiveMessagesCorruptError("invalid message record") from exc
 
         return messages
+
+    async def recent_messages(self, commit_count: int) -> List[Message]:
+        """Read the message retry window without listing or indexing history.
+
+        A context reset adds an empty boundary after the raw archive. Inspect
+        at most that boundary and its immediate predecessor, never older raw.
+        """
+        for index in range(commit_count, max(0, commit_count - 2), -1):
+            uri = f"{self._session_uri}/history/archive_{index:03d}"
+            if not await self.is_context_reset_archive(uri):
+                return await self.read_messages(uri)
+        return []
 
     async def read_meta(self, archive_uri: str) -> Dict[str, Any]:
         try:

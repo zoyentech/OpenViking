@@ -8,7 +8,9 @@ from typing import Any, Dict, List, Optional
 
 from openviking.message import Message
 from openviking.session.archive_store import is_storage_not_found
-from openviking_cli.exceptions import ConflictError, InvalidArgumentError
+from openviking_cli.exceptions import ConflictError, InvalidArgumentError, NotFoundError
+
+COMMIT_RECEIPT_LIMIT = 8
 
 
 class MessageWriteResult(list):
@@ -48,6 +50,25 @@ def validate_source_ids(value: Optional[List[str]]) -> Optional[List[str]]:
     if len(set(value)) != len(value):
         raise InvalidArgumentError("source_message_ids must not contain duplicates")
     return list(value)
+
+
+def identify_message_group(group: List[Message], spec: Dict[str, Any]) -> None:
+    """Bind physical messages to their input before splitting/externalization."""
+    payload = Message(
+        id="", role=spec["role"], parts=spec["parts"], peer_id=group[0].peer_id
+    ).to_dict()
+    payload.pop("id")
+    for key in ("created_at", "turn_id", "message_kind"):
+        payload[key] = spec.get(key)
+    payload["source_message_ids"] = sorted(group[0].source_message_ids)
+    payload_hash = fingerprint(payload)
+    for index, message in enumerate(group):
+        message.source_message_identity = {
+            "payload_hash": payload_hash,
+            "group_id": group[0].id,
+            "group_size": len(group),
+            "group_index": index,
+        }
 
 
 def select_message_groups(
@@ -103,12 +124,14 @@ def select_message_groups(
 
 
 class CommitReceipts:
-    """One durable receipt file per session, independent of expiring task records.
+    """A bounded retry window, independent of expiring task records.
 
     Reserve before Phase 1 side effects, finish before releasing the same session
     lock. An interrupted reservation is retained: replay must never allocate a
     second archive. Archive/QueueFS state remains the authority for progress.
-    No credentials or raw payloads are stored in this file.
+    Keep the latest eight attempts by insertion order; retries do not refresh
+    their position. Unfinished reservations are never evicted. No credentials
+    or raw payloads are stored in this file.
     """
 
     def __init__(self, fs: Any, ctx: Any, session_uri: str):
@@ -128,6 +151,11 @@ class CommitReceipts:
         return data
 
     async def write(self, entries: Dict[str, Any]) -> None:
+        while len(entries) > COMMIT_RECEIPT_LIMIT:
+            oldest = next((key for key, entry in entries.items() if entry["finished"]), None)
+            if oldest is None:
+                raise ConflictError("Commit retry window is full of unfinished attempts")
+            del entries[oldest]
         await self.fs.write_file(self.uri, json.dumps(entries, ensure_ascii=False), ctx=self.ctx)
 
     async def get(self, key: str, request_hash: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -147,68 +175,34 @@ class CommitReceipts:
         }
         await self.write(entries)
 
-
-class SourceMessageIndex:
-    """Rebuildable source-to-archive pointers; raw messages are authoritative.
-
-    Index an archive before clearing its messages from live storage. This order
-    makes a crash safe without a second message payload store or a transaction
-    spanning two files. A missing index is bootstrapped once from archive raw.
-    """
-
-    def __init__(self, fs: Any, ctx: Any, session_uri: str, archives: Any):
-        self.fs, self.ctx, self.archives = fs, ctx, archives
-        self.uri = f"{session_uri}/.source-message-index.json"
-
-    @staticmethod
-    def add(data: Dict[str, Any], archive_uri: str, messages: List[Message]) -> None:
-        for message in messages:
-            for source_id in delivery_source_ids(message):
-                refs = data["sources"].setdefault(source_id, [])
-                if archive_uri not in refs:
-                    refs.append(archive_uri)
-
-    async def load(self, commit_count: int) -> Dict[str, Any]:
-        try:
-            data = json.loads(await self.fs.read_file(self.uri, ctx=self.ctx))
-        except Exception as exc:
-            if not is_storage_not_found(exc):
-                raise
-            data = {"through": -1, "sources": {}}
-        if data["through"] < commit_count:
-            for ref in await self.archives.list_refs(strict=True):
-                if ref["index"] <= data["through"]:
-                    continue
+    async def status(self, key: str, archives: Any) -> Dict[str, Any]:
+        """Expose a retained receipt and summary without internal file names."""
+        entry = await self.get(key)
+        if entry is None:
+            raise NotFoundError("Commit receipt not found or outside the retry window")
+        receipt = entry["result"]
+        archive_uri = receipt.get("archive_uri")
+        state = "pending" if archive_uri else "skipped"
+        failure, overview = None, ""
+        if archive_uri:
+            for name, terminal in ((".done", "completed"), (".failed.json", "failed")):
                 try:
-                    messages = await self.archives.read_messages(ref["archive_uri"])
+                    marker = json.loads(
+                        await self.fs.read_file(f"{archive_uri}/{name}", ctx=self.ctx)
+                    )
                 except Exception as exc:
                     if not is_storage_not_found(exc):
                         raise
-                    if await self.archives.is_context_reset_archive(ref["archive_uri"]):
-                        continue
-                    # Missing historical raw is not evidence of an unused ID.
-                    # Fail closed, including while rebuilding a missing index.
-                    raise
-                self.add(data, ref["archive_uri"], messages)
-            data["through"] = max(0, commit_count)
-            await self.save(data)
-        return data
-
-    async def save(self, data: Dict[str, Any]) -> None:
-        await self.fs.write_file(self.uri, json.dumps(data, ensure_ascii=False), ctx=self.ctx)
-
-    async def index_archive(
-        self, archive_uri: str, messages: List[Message], commit_count: int
-    ) -> None:
-        data = await self.load(commit_count)
-        self.add(data, archive_uri, messages)
-        data["through"] = max(data["through"], self.archives.archive_index_from_uri(archive_uri))
-        await self.save(data)
-
-    async def lookup(self, source_ids: set[str], commit_count: int) -> List[Message]:
-        data = await self.load(commit_count)
-        refs = {uri for source_id in source_ids for uri in data["sources"].get(source_id, [])}
-        result = []
-        for uri in sorted(refs):
-            result.extend(await self.archives.read_messages(uri))
-        return result
+                else:
+                    state = terminal
+                    if terminal == "failed":
+                        failure = marker
+                    break
+            overview = await archives.read_overview(archive_uri)
+        return {
+            "receipt": receipt,
+            "archive_state": state,
+            "summary_ready": state == "completed" and bool(overview),
+            "overview": overview if state == "completed" else "",
+            "failure": failure,
+        }

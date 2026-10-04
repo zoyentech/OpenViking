@@ -21,10 +21,13 @@ session URIs. URI-based APIs may also accept the backward-compatible
 
 For `POST /api/v1/sessions/{session_id}/messages` and `/messages/batch`, a
 nonempty `source_message_ids` list identifies one original input payload. Repeating
-the same source ID set and payload returns the original `message_ids`, including
-after commit, retention, reset, or a server restart. The response `added` counts
-new physical messages; a fully duplicated batch returns `0`. Tool-result aggregates
-can produce several physical message IDs for one input.
+the same source ID set and payload returns the original `message_ids` while the
+input remains in the retry window: current live messages and the most recent
+committed raw archive. A reset adds an empty boundary; in that case only its
+immediate predecessor is also checked. No older archives are searched. The window
+survives a server restart. The response `added` counts new physical messages; a
+fully duplicated batch returns `0`. Tool-result aggregates can produce several
+physical message IDs for one input.
 
 ```json
 {"messages": [{"role": "user", "content": "Remember this", "source_message_ids": ["upstream-message-123"]}]}
@@ -40,8 +43,11 @@ Messages with no IDs (or an empty list) retain ordinary append semantics, includ
 inside mixed batches. `message_kind="checkpoint"` uses `source_message_ids` as
 cumulative provenance and is also excluded from delivery deduplication. Historical
 messages written before this feature lack the original input fingerprint; reuse of
-their non-checkpoint source IDs returns `409` rather than silently guessing whether
-the payload matches. Clients should start with fresh source IDs for new messages.
+their non-checkpoint source IDs within the window returns `409` rather than
+silently guessing whether the payload matches. Once an ID is absent from live
+messages and the most recent archive, sending it again is a new write. Clients
+must finish retrying a batch before advancing through further commits; this is
+timeout recovery, not a way to reimport a session's history without duplicates.
 
 `POST /api/v1/sessions/{session_id}/commit` accepts an optional `idempotency_key`:
 
@@ -51,12 +57,16 @@ the payload matches. Clients should start with fresh source IDs for new messages
 
 Use the same key and parameters after a timeout. The server returns the original
 receipt (`task_id`, `archive_uri`, `trace_id`, retention results), without cutting
-another archive, even if new messages have arrived. This includes skipped commits
+another archive, even if new messages have arrived, while its receipt is retained.
+This includes skipped commits
 and `reset_context`; keyed resets additionally return `reset_archive_uri`. Changing
 commit parameters with the same key returns HTTP `409`. Keys are nonblank strings
-of at most 256 characters and live until the session is deleted. They are scoped to
-the authenticated account, user, and session; rotating an API key does not change
-that scope. Telemetry options are not part of the commit payload identity.
+of at most 256 characters. The latest **8 attempts** are kept in insertion order;
+retrying a key does not refresh its position. An unfinished Phase 1 reservation
+cannot be evicted: it is resolved under the session lock before another commit
+starts. Keys are scoped to the authenticated account, user, and session; rotating
+an API key does not change that scope. Telemetry options are not part of the commit
+payload identity.
 
 ```http
 GET /api/v1/sessions/{session_id}/commit-status?idempotency_key=commit-request-456
@@ -64,8 +74,10 @@ GET /api/v1/sessions/{session_id}/commit-status?idempotency_key=commit-request-4
 
 This authenticated endpoint returns `receipt`, `archive_state` (`pending`,
 `completed`, `failed`, or `skipped`), `summary_ready`, the completed `overview`, and
-`failure` details. An unknown key returns `404`. Receipt lookup is independent of
-task-record expiry, so clients do not need to inspect storage files or predict
+`failure` details. An unknown or evicted key returns `404`. Posting an evicted key
+starts a new attempt, so clients must not retry keys indefinitely. Receipt lookup
+within this window is independent of task-record expiry; clients do not need to
+inspect storage files or predict
 archive names. A completed archive can have `summary_ready=false` when working
 memory generation was disabled.
 
@@ -78,11 +90,11 @@ its status before deliberately starting a new attempt with a new key. Recovery
 never reconstructs or deletes unrelated messages based on a message count.
 
 The guarantee covers message acceptance and commit/archive identity. It does not
-make Phase 2 memory extraction or its external side effects exactly once. Receipt
-metadata and the rebuildable source-to-archive index are whole JSON files whose
-size grows with the session. Normal retries read only matching archive raw files;
-the index is initially built from history, and missing/corrupt authoritative data
-fails closed. These APIs require a server version containing this feature; older
+make Phase 2 memory extraction or its external side effects exactly once. There
+is no historical source index. Message retries use the existing live file and one
+recent raw archive; commit receipts occupy one JSON file with at most 8 entries.
+Missing/corrupt raw data inside the window fails closed without searching older
+archives. These APIs require a server version containing this feature; older
 servers may ignore the new commit request field.
 
 ### create_session()

@@ -27,6 +27,7 @@ class Store:
         self.files = {}
         self.locks = defaultdict(asyncio.Lock)
         self.reads = []
+        self.writes = []
         self.listings = 0
         self.fault = None
         self.fault_error = ProcessCrash
@@ -57,11 +58,13 @@ class Store:
         return self.files[path]
 
     async def write_file(self, uri, content, ctx=None, lease_ref=None):
+        self.writes.append(uri)
         self.crash("write", uri, content, False)
         self.files[self._uri_to_path(uri, ctx)] = content
         self.crash("write", uri, content, True)
 
     async def append_file(self, uri, content, ctx=None):
+        self.writes.append(uri)
         self.crash("append", uri, content, False)
         self.files[self._uri_to_path(uri, ctx)] += content
         self.crash("append", uri, content, True)
@@ -175,23 +178,98 @@ async def test_payload_conflict_rejects_entire_batch(env, change):
 
 
 @pytest.mark.asyncio
-async def test_archived_retry_uses_index_and_survives_index_rebuild(env):
+async def test_message_retry_window_moves_with_latest_raw_archive(env):
     store, _, new = env
     session = new()
     original = await session.add_messages_async([spec()])
     first = await session.commit_async()
-    await session.add_messages_async([spec("unrelated", "unrelated")])
-    second = await session.commit_async()
     store.reads.clear()
     listings = store.listings
     replay = await new().add_messages_async([spec()])
-    assert [message.id for message in replay] == [original[0].id]
-    assert f"{second['archive_uri']}/messages.jsonl" not in store.reads
-    assert f"{first['archive_uri']}/messages.jsonl" in store.reads
+    assert replay.added == 0
+    assert replay[0].id == original[0].id
+    assert [
+        uri for uri in store.reads if "/history/" in uri and uri.endswith("/messages.jsonl")
+    ] == [f"{first['archive_uri']}/messages.jsonl"]
+
+    latest = await session.add_messages_async([spec("latest", "latest")])
+    second = await session.commit_async()
+    store.reads.clear()
+    outside_window = await new().add_messages_async([spec()])
+    assert outside_window.added == 1
+    assert outside_window[0].id != original[0].id
+    assert [
+        uri for uri in store.reads if "/history/" in uri and uri.endswith("/messages.jsonl")
+    ] == [f"{second['archive_uri']}/messages.jsonl"]
+    assert (await new().add_messages_async([spec("latest", "latest")]))[0].id == latest[0].id
     assert store.listings == listings
-    del store.files[store._uri_to_path(session._source_index.uri, session.ctx)]
-    assert (await new().add_messages_async([spec()]))[0].id == original[0].id
-    assert store.listings == listings + 1
+    assert not any(uri.endswith("/.source-message-index.json") for uri in store.writes)
+    assert not any(uri.endswith("/.source-message-index.json") for uri in store.reads)
+
+
+@pytest.mark.asyncio
+async def test_reset_retry_checks_only_boundary_and_its_immediate_predecessor(env):
+    store, _, new = env
+    session = new()
+    old = await session.add_messages_async([spec("old", "old")])
+    oldest = await session.commit_async()
+    latest = await session.add_messages_async([spec()])
+    reset = await session.commit_async(idempotency_key="reset", reset_context=True)
+    store.reads.clear()
+    listings = store.listings
+    replay = await new().add_messages_async([spec()])
+    assert replay.added == 0
+    assert replay[0].id == latest[0].id
+    raw_reads = [
+        uri for uri in store.reads if "/history/" in uri and uri.endswith("/messages.jsonl")
+    ]
+    assert f"{reset['archive_uri']}/messages.jsonl" in raw_reads
+    assert set(raw_reads) <= {
+        f"{reset['archive_uri']}/messages.jsonl",
+        f"{reset['reset_archive_uri']}/messages.jsonl",
+    }
+    assert len(raw_reads) <= 2
+    assert f"{oldest['archive_uri']}/messages.jsonl" not in store.reads
+    expired = await new().add_messages_async([spec("old", "old")])
+    assert expired.added == 1
+    assert expired[0].id != old[0].id
+    assert store.listings == listings
+    assert not any(uri.endswith("/.source-message-index.json") for uri in store.writes)
+
+
+@pytest.mark.asyncio
+async def test_retry_does_not_scan_past_two_consecutive_reset_boundaries(env):
+    store, _, new = env
+    session = new()
+    original = await session.add_messages_async([spec()])
+    first = await session.commit_async()
+    # Consecutive empty boundaries can exist in imported history. The read
+    # bound must hold even when neither of the two candidates contains raw.
+    for index in (2, 3):
+        await store.write_file(
+            f"{session.uri}/history/archive_{index:03d}/.done",
+            json.dumps({"context_reset": True}),
+            ctx=session.ctx,
+        )
+    meta_uri = f"{session.uri}/.meta.json"
+    meta = json.loads(await store.read_file(meta_uri, ctx=session.ctx))
+    meta["commit_count"] = 3
+    await store.write_file(meta_uri, json.dumps(meta), ctx=session.ctx)
+    store.reads.clear()
+    listings = store.listings
+    replay = await new().add_messages_async([spec()])
+    assert replay.added == 1
+    assert replay[0].id != original[0].id
+    raw_reads = [
+        uri for uri in store.reads if "/history/" in uri and uri.endswith("/messages.jsonl")
+    ]
+    assert len(raw_reads) <= 2
+    assert f"{first['archive_uri']}/messages.jsonl" not in store.reads
+    assert set(raw_reads) <= {
+        f"{session.uri}/history/archive_002/messages.jsonl",
+        f"{session.uri}/history/archive_003/messages.jsonl",
+    }
+    assert store.listings == listings
 
 
 @pytest.mark.asyncio
@@ -265,6 +343,96 @@ async def test_skipped_commit_is_also_idempotent(env, keep):
     assert not jobs
 
 
+@pytest.mark.asyncio
+async def test_commit_receipts_keep_eight_and_expired_key_starts_new_attempt(env):
+    _, jobs, new = env
+    receipts = []
+    for index in range(9):
+        await new().add_messages_async([spec(f"message {index}", None)])
+        receipts.append(await new().commit_async(idempotency_key=f"commit-{index}"))
+        if index == 7:
+            # Reading/replaying the oldest retained key does not refresh its
+            # first-write order before the ninth reservation is created.
+            assert await new().commit_async(idempotency_key="commit-0") == receipts[0]
+    assert len(await new()._commit_receipts.read()) == 8
+    with pytest.raises(NotFoundError):
+        await new().get_commit_status("commit-0")
+    for index in range(1, 9):
+        assert (await new().get_commit_status(f"commit-{index}"))["receipt"] == receipts[index]
+
+    await new().add_messages_async([spec("new content after key expired", None)])
+    restarted = await new().commit_async(idempotency_key="commit-0")
+    assert restarted["status"] == "accepted"
+    assert restarted["task_id"] != receipts[0]["task_id"]
+    assert restarted["archive_uri"] != receipts[0]["archive_uri"]
+    assert len(jobs) == 10
+    assert len(await new()._commit_receipts.read()) == 8
+    with pytest.raises(NotFoundError):
+        await new().get_commit_status("commit-1")
+
+
+@pytest.mark.asyncio
+async def test_receipt_capacity_never_evicts_an_unfinished_reservation(env):
+    store, _, new = env
+    session = new()
+    receipts = session._commit_receipts
+    lease = await store.acquire(store._uri_to_path(session.uri, session.ctx))
+    try:
+        await receipts.save("unfinished", "pending-hash", {"status": "accepted"}, finished=False)
+        for index in range(7):
+            await receipts.save(
+                f"finished-{index}", "done-hash", {"status": "skipped"}, finished=True
+            )
+        await receipts.save("newest", "new-hash", {"status": "accepted"}, finished=False)
+        entries = await receipts.read()
+        assert len(entries) == 8
+        assert not (await receipts.get("unfinished"))["finished"]
+        assert not (await receipts.get("newest"))["finished"]
+        assert await receipts.get("finished-0") is None
+        assert await receipts.get("finished-1") is not None
+    finally:
+        await store.release(lease)
+
+
+@pytest.mark.asyncio
+async def test_new_key_resolves_old_reservation_under_lock_before_capacity_eviction(
+    env, monkeypatch
+):
+    store, jobs, new = env
+    for index in range(7):
+        await new().add_messages_async([spec(f"finished {index}", None)])
+        await new().commit_async(idempotency_key=f"finished-{index}")
+    await new().add_messages_async([spec("pending publication", None)])
+    store.fault = crash_point("ready", True)
+    with pytest.raises(ProcessCrash):
+        await new().commit_async(idempotency_key="unfinished")
+
+    session = new()
+    assert len(await session._commit_receipts.read()) == 8
+    assert not (await session._commit_receipts.get("unfinished"))["finished"]
+    original_save = session._commit_receipts.save
+    observed = []
+
+    async def save_after_recovery(key, request_hash, result, *, finished):
+        if key == "newest" and not finished:
+            previous = await session._commit_receipts.get("unfinished")
+            assert previous["finished"]
+            assert previous["result"]["status"] == "accepted"
+            assert store.locks[store._uri_to_path(session.uri, session.ctx)].locked()
+            observed.append(True)
+        await original_save(key, request_hash, result, finished=finished)
+
+    monkeypatch.setattr(session._commit_receipts, "save", save_after_recovery)
+    newest = await session.commit_async(idempotency_key="newest")
+    assert newest["status"] == "skipped"
+    assert observed == [True]
+    assert len(jobs) == 8
+    assert len(await session._commit_receipts.read()) == 8
+    assert (await session.get_commit_status("unfinished"))["receipt"]["status"] == "accepted"
+    with pytest.raises(NotFoundError):
+        await session.get_commit_status("finished-0")
+
+
 def crash_point(stage, after):
     def match(op, uri, content, when):
         if when != after:
@@ -272,15 +440,13 @@ def crash_point(stage, after):
         if stage == "enqueue":
             return op == "enqueue"
         if stage in ("reserve", "finish") and uri.endswith("/.commit-receipts.json"):
-            return next(iter(json.loads(content).values()))["finished"] == (stage == "finish")
+            return list(json.loads(content).values())[-1]["finished"] == (stage == "finish")
         if stage in ("intent", "ready") and "/history/" in uri and uri.endswith("/.meta.json"):
             return json.loads(content)["phase1"]["status"] == (
                 "ready" if stage == "ready" else "preparing"
             )
         if stage == "raw":
             return "/history/" in uri and uri.endswith("/messages.jsonl")
-        if stage == "index":
-            return uri.endswith("/.source-message-index.json")
         if stage == "root":
             return "/history/" not in uri and uri.endswith("/messages.jsonl")
         if stage == "meta":
@@ -296,7 +462,7 @@ def crash_point(stage, after):
 @pytest.mark.parametrize("after", [False, True])
 @pytest.mark.parametrize(
     "stage",
-    ["reserve", "intent", "raw", "enqueue", "index", "root", "meta", "ready", "reset", "finish"],
+    ["reserve", "intent", "raw", "enqueue", "root", "meta", "ready", "reset", "finish"],
 )
 async def test_commit_process_crash_never_recuts_or_loses_messages(env, stage, after):
     store, jobs, new = env
@@ -367,14 +533,37 @@ async def test_status_returns_summary_and_durable_receipt_without_task_tracker(e
 
 
 @pytest.mark.asyncio
-async def test_corrupt_or_unreadable_index_cannot_accept_duplicate(env):
+@pytest.mark.parametrize("failure", ["missing", "corrupt", "unreadable"])
+async def test_latest_archive_read_failure_does_not_fall_back_or_accept_message(
+    env, monkeypatch, failure
+):
     store, _, new = env
     session = new()
     await session.add_messages_async([spec()])
-    await session.commit_async()
-    await store.write_file(session._source_index.uri, "broken json", ctx=session.ctx)
-    with pytest.raises(ValueError):
+    old = await session.commit_async()
+    await session.add_messages_async([spec("latest", "latest")])
+    latest = await session.commit_async()
+    raw_uri = f"{latest['archive_uri']}/messages.jsonl"
+    if failure == "missing":
+        del store.files[store._uri_to_path(raw_uri, session.ctx)]
+        expected = FileNotFoundError
+    elif failure == "corrupt":
+        await store.write_file(raw_uri, "broken json", ctx=session.ctx)
+        expected = ValueError
+    else:
+        read_file = store.read_file
+
+        async def unreadable(uri, ctx=None):
+            if uri == raw_uri:
+                raise OSError("archive unavailable")
+            return await read_file(uri, ctx=ctx)
+
+        monkeypatch.setattr(store, "read_file", unreadable)
+        expected = OSError
+    store.reads.clear()
+    with pytest.raises(expected):
         await new().add_messages_async([spec()])
+    assert f"{old['archive_uri']}/messages.jsonl" not in store.reads
     check = new()
     await check.load()
     assert not check.messages
@@ -490,3 +679,19 @@ async def test_real_router_and_service_http_contract(env, monkeypatch):
         assert status.json()["result"]["receipt"] == commit.json()["result"]
         missing = await client.get(base + "/commit-status", params={"idempotency_key": "missing"})
         assert missing.status_code == 404, missing.text
+
+        # Eight newer commit attempts evict the original key even when they
+        # skipped an empty session; retry access does not extend its lifetime.
+        for index in range(8):
+            newer = await client.post(base + "/commit", json={"idempotency_key": f"newer-{index}"})
+            assert newer.status_code == 200, newer.text
+            assert newer.json()["result"]["status"] == "skipped"
+        expired = await client.get(base + "/commit-status", params={"idempotency_key": "key"})
+        assert expired.status_code == 404, expired.text
+        added = await client.post(
+            base + "/messages", json={"role": "user", "content": "after expiry"}
+        )
+        assert added.status_code == 200, added.text
+        restarted = await client.post(base + "/commit", json={"idempotency_key": "key"})
+        assert restarted.status_code == 200, restarted.text
+        assert restarted.json()["result"]["task_id"] != commit.json()["result"]["task_id"]

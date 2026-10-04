@@ -58,3 +58,28 @@ async def test_message_and_commit_http_retry_contract(client):
     assert missing.status_code == 404, missing.text
     current = await client.get(base)
     assert current.json()["result"]["message_count"] == 1
+
+    # A newer raw archive moves the message retry window past the original
+    # messages, so the same source IDs now identify a new delivery.
+    latest = await client.post(base + "/commit", json={"idempotency_key": "request-two"})
+    assert latest.status_code == 200, latest.text
+    outside_window = await client.post(base + "/messages/batch", json=body)
+    assert outside_window.status_code == 200, outside_window.text
+    assert outside_window.json()["result"]["added"] == 2
+    assert outside_window.json()["result"]["message_ids"] != first.json()["result"]["message_ids"]
+
+    # Receipts keep only eight attempts, in first-write order. Both archived
+    # and skipped attempts participate in this bound.
+    for index in range(3, 10):
+        newer = await client.post(base + "/commit", json={"idempotency_key": f"request-{index}"})
+        assert newer.status_code == 200, newer.text
+    expired = await client.get(base + "/commit-status", params={"idempotency_key": "request-one"})
+    assert expired.status_code == 404, expired.text
+    newest = await client.get(base + "/commit-status", params={"idempotency_key": "request-9"})
+    assert newest.status_code == 200, newest.text
+    added = await client.post(base + "/messages", json={"role": "user", "content": "after expiry"})
+    assert added.status_code == 200, added.text
+    restarted = await client.post(base + "/commit", json={"idempotency_key": "request-one"})
+    assert restarted.status_code == 200, restarted.text
+    assert restarted.json()["result"]["task_id"] != receipt["task_id"]
+    assert restarted.json()["result"]["archive_uri"] != receipt["archive_uri"]

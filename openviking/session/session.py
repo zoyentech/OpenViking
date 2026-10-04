@@ -61,9 +61,9 @@ from openviking.session.extraction_batch import (
 from openviking.session.idempotency import (
     CommitReceipts,
     MessageWriteResult,
-    SourceMessageIndex,
     delivery_source_ids,
     fingerprint,
+    identify_message_group,
     select_message_groups,
     validate_key,
     validate_source_ids,
@@ -486,9 +486,6 @@ class Session:
         self._session_uri = session_uri or canonical_session_uri(self.ctx, self.session_id)
         self._archives = ArchiveStore(self._viking_fs, self.ctx, self._session_uri)
         self._commit_receipts = CommitReceipts(self._viking_fs, self.ctx, self._session_uri)
-        self._source_index = SourceMessageIndex(
-            self._viking_fs, self.ctx, self._session_uri, self._archives
-        )
         self._checkpoints = CheckpointPlanner(self._archives)
         self._tool_outputs = ToolOutputExternalizer(
             self._viking_fs, self._session_uri, self.session_id, self.ctx
@@ -807,9 +804,7 @@ class Session:
                 source_id for group in groups for source_id in delivery_source_ids(group[0])
             }
             archived = (
-                await self._source_index.lookup(source_ids, self._meta.commit_count)
-                if source_ids
-                else []
+                await self._archives.recent_messages(self._meta.commit_count) if source_ids else []
             )
             new_groups, result = select_message_groups(groups, archived + self._messages)
             messages: List[Message] = []
@@ -958,24 +953,7 @@ class Session:
                 message_groups.append([msg])
 
             if source_message_ids and message_kind != "checkpoint":
-                # Use the input before splitting/externalization and exclude
-                # generated IDs/timestamps. Explicit timestamps are semantic.
-                payload = Message(id="", role=role, parts=parts, peer_id=peer_id).to_dict()
-                payload.pop("id")
-                payload["created_at"] = spec.get("created_at")
-                payload["turn_id"] = turn_id
-                payload["message_kind"] = message_kind
-                payload["source_message_ids"] = sorted(source_message_ids)
-                group = message_groups[-1]
-                group_id = group[0].id
-                payload_hash = fingerprint(payload)
-                for index, message in enumerate(group):
-                    message.source_message_identity = {
-                        "payload_hash": payload_hash,
-                        "group_id": group_id,
-                        "group_size": len(group),
-                        "group_index": index,
-                    }
+                identify_message_group(message_groups[-1], spec)
 
         return message_groups
 
@@ -1222,7 +1200,7 @@ class Session:
         phase1 = (await self._archives.read_meta(archive_uri)).get("phase1")
         return dict(phase1) if isinstance(phase1, dict) else {}
 
-    async def _ensure_phase1_ready(self, archive_uri: str) -> bool:
+    async def _ensure_phase1_ready(self, archive_uri: str, *, lock_held: bool = False) -> bool:
         """Verify or recover a queued Phase 1 before Phase 2 consumes it.
 
         New commits persist the archive intent and rewrite root messages while
@@ -1241,105 +1219,104 @@ class Session:
             return False
 
         session_path = self._viking_fs._uri_to_path(self._session_uri, ctx=self.ctx)
-        lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(
-            session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
-        )
-        try:
-            return await self._recover_phase1_ready_locked(archive_uri)
-        finally:
-            await self._viking_fs._async_agfs.pathlock_release(lease)
-
-    async def _recover_phase1_ready_locked(self, archive_uri: str) -> bool:
-        """Recover a Phase 1 while the caller holds the session path lock."""
-        marker = await self._read_phase1_meta(archive_uri)
-        if marker.get("status") == "ready":
-            return True
-        if await self._archives.file_exists(archive_uri, ".failed.json"):
-            return False
-
-        queue_message = marker.get("queue_message")
-        task_id = queue_message.get("task_id") if isinstance(queue_message, dict) else None
-        from openviking.service.task_tracker import get_task_tracker
-
-        tracker = get_task_tracker()
-        if not task_id or not await tracker.has_work(str(task_id)):
-            error = "Phase 1 has no QueueFS work to resume"
-            await self._write_failed_marker(
-                archive_uri,
-                stage="phase1_recovery",
-                error=error,
+        lease = None
+        if not lock_held:
+            lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(
+                session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
             )
-            if task_id:
-                await tracker.fail(
-                    str(task_id),
-                    error,
-                    account_id=self.ctx.account_id,
-                    user_id=self.ctx.user.user_id,
+        try:
+            marker = await self._read_phase1_meta(archive_uri)
+            if marker.get("status") == "ready":
+                return True
+            if await self._archives.file_exists(archive_uri, ".failed.json"):
+                return False
+
+            queue_message = marker.get("queue_message")
+            task_id = queue_message.get("task_id") if isinstance(queue_message, dict) else None
+            from openviking.service.task_tracker import get_task_tracker
+
+            tracker = get_task_tracker()
+            if not task_id or not await tracker.has_work(str(task_id)):
+                error = "Phase 1 has no QueueFS work to resume"
+                await self._write_failed_marker(
+                    archive_uri,
+                    stage="phase1_recovery",
+                    error=error,
                 )
-            return False
+                if task_id:
+                    await tracker.fail(
+                        str(task_id),
+                        error,
+                        account_id=self.ctx.account_id,
+                        user_id=self.ctx.user.user_id,
+                    )
+                return False
 
-        try:
-            if not marker:
-                raise ValueError("Phase 1 metadata is missing")
-            retained_ids = marker.get("retained_message_ids")
-            archived_ids = marker.get("archived_message_ids")
-            if not isinstance(retained_ids, list) or not isinstance(archived_ids, list):
-                raise ValueError("Phase 1 metadata has invalid message ID lists")
-            retained_ids = [item for item in retained_ids if isinstance(item, str)]
-            archived_ids = [item for item in archived_ids if isinstance(item, str)]
-            live_messages = await self._read_live_messages_strict()
-        except Exception as exc:
-            await self._write_failed_marker(
-                archive_uri,
-                stage="phase1_recovery",
-                error=f"Cannot verify Phase 1 state: {exc}",
-            )
-            return False
+            try:
+                if not marker:
+                    raise ValueError("Phase 1 metadata is missing")
+                retained_ids = marker.get("retained_message_ids")
+                archived_ids = marker.get("archived_message_ids")
+                if not isinstance(retained_ids, list) or not isinstance(archived_ids, list):
+                    raise ValueError("Phase 1 metadata has invalid message ID lists")
+                retained_ids = [item for item in retained_ids if isinstance(item, str)]
+                archived_ids = [item for item in archived_ids if isinstance(item, str)]
+                live_messages = await self._read_live_messages_strict()
+            except Exception as exc:
+                await self._write_failed_marker(
+                    archive_uri,
+                    stage="phase1_recovery",
+                    error=f"Cannot verify Phase 1 state: {exc}",
+                )
+                return False
 
-        live_ids = [message.id for message in live_messages]
-        archived_only_ids = set(archived_ids) - set(retained_ids)
-        phase1_applied = live_ids[
-            : len(retained_ids)
-        ] == retained_ids and not archived_only_ids.intersection(live_ids)
-        if not phase1_applied:
-            await self._write_failed_marker(
-                archive_uri,
-                stage="phase1_recovery",
-                error="Root rewrite was not durably completed before process interruption",
-            )
-            return False
+            live_ids = [message.id for message in live_messages]
+            archived_only_ids = set(archived_ids) - set(retained_ids)
+            phase1_applied = live_ids[
+                : len(retained_ids)
+            ] == retained_ids and not archived_only_ids.intersection(live_ids)
+            if not phase1_applied:
+                await self._write_failed_marker(
+                    archive_uri,
+                    stage="phase1_recovery",
+                    error="Root rewrite was not durably completed before process interruption",
+                )
+                return False
 
-        # Root is authoritative and proves the rewrite completed. Reconcile
-        # metadata that may have been interrupted immediately afterwards.
-        try:
-            meta_content = await self._viking_fs.read_file(
-                f"{self._session_uri}/.meta.json",
-                ctx=self.ctx,
+            # Root is authoritative and proves the rewrite completed. Reconcile
+            # metadata that may have been interrupted immediately afterwards.
+            try:
+                meta_content = await self._viking_fs.read_file(
+                    f"{self._session_uri}/.meta.json",
+                    ctx=self.ctx,
+                )
+                self._meta = SessionMeta.from_dict(json.loads(meta_content))
+            except Exception:
+                pass
+            self._messages = live_messages
+            self._remember_retention_policy(
+                keep_recent_count=max(0, int(marker.get("keep_recent_count", 0) or 0)),
+                retention_mode=str(marker.get("retention_mode", "") or "") or None,
+                keep_recent_turn_count=max(0, int(marker.get("keep_recent_turn_count", 0) or 0)),
+                retained_message_token_budget=max(
+                    0, int(marker.get("retained_message_token_budget", 0) or 0)
+                ),
+                min_raw_tail_steps=max(0, int(marker.get("min_raw_tail_steps", 1) or 0)),
             )
-            self._meta = SessionMeta.from_dict(json.loads(meta_content))
-        except Exception:
-            pass
-        self._messages = live_messages
-        self._remember_retention_policy(
-            keep_recent_count=max(0, int(marker.get("keep_recent_count", 0) or 0)),
-            retention_mode=str(marker.get("retention_mode", "") or "") or None,
-            keep_recent_turn_count=max(0, int(marker.get("keep_recent_turn_count", 0) or 0)),
-            retained_message_token_budget=max(
-                0, int(marker.get("retained_message_token_budget", 0) or 0)
-            ),
-            min_raw_tail_steps=max(0, int(marker.get("min_raw_tail_steps", 1) or 0)),
-        )
-        self._meta.message_count = len(live_messages)
-        self._meta.commit_count = max(
-            self._meta.commit_count,
-            self._archives.archive_index_from_uri(archive_uri),
-        )
-        self._meta.last_commit_at = get_current_timestamp()
-        await self._rebuild_pending_tokens()
-        await self._save_meta()
-        await self._write_phase1_ready_marker(archive_uri)
-        logger.warning("Recovered interrupted Session Phase 1: %s", archive_uri)
-        return True
+            self._meta.message_count = len(live_messages)
+            self._meta.commit_count = max(
+                self._meta.commit_count,
+                self._archives.archive_index_from_uri(archive_uri),
+            )
+            self._meta.last_commit_at = get_current_timestamp()
+            await self._rebuild_pending_tokens()
+            await self._save_meta()
+            await self._write_phase1_ready_marker(archive_uri)
+            logger.warning("Recovered interrupted Session Phase 1: %s", archive_uri)
+            return True
+        finally:
+            if lease is not None:
+                await self._viking_fs._async_agfs.pathlock_release(lease)
 
     async def _resolve_pending_commit_receipts(self) -> None:
         """Finish or fail interrupted reservations under the session path lock.
@@ -1367,7 +1344,7 @@ class Session:
                         raise
                     marker = None
                 if marker:
-                    ready = await self._recover_phase1_ready_locked(archive_uri)
+                    ready = await self._ensure_phase1_ready(archive_uri, lock_held=True)
                 else:
                     ready = False
                     await self._write_failed_marker(
@@ -1377,7 +1354,7 @@ class Session:
                     )
             if ready:
                 if result.get("reset_archive_uri"):
-                    await self._publish_keyed_reset(result["reset_archive_uri"])
+                    await self._append_context_reset_archive(result["reset_archive_uri"])
             else:
                 result = {
                     **result,
@@ -1390,27 +1367,6 @@ class Session:
         if changed:
             await self._commit_receipts.write(entries)
 
-    async def _publish_keyed_reset(self, archive_uri: str) -> None:
-        """Publish the boundary reserved by a keyed commit, exactly at that URI."""
-        await self._viking_fs.write_file(
-            f"{archive_uri}/.done",
-            json.dumps({"context_reset": True, "working_memory_enabled": False}),
-            ctx=self.ctx,
-        )
-        # Reload before merging: a retry must not overwrite concurrent metadata.
-        try:
-            content = await self._viking_fs.read_file(
-                f"{self._session_uri}/.meta.json", ctx=self.ctx
-            )
-            self._meta = SessionMeta.from_dict(json.loads(content))
-        except Exception as exc:
-            if not _is_storage_not_found(exc):
-                raise
-        index = self._archives.archive_index_from_uri(archive_uri)
-        self._meta.commit_count = max(self._meta.commit_count, index)
-        self._compression.compression_index = max(self._compression.compression_index, index)
-        await self._save_meta()
-
     async def get_commit_status(self, idempotency_key: str) -> Dict[str, Any]:
         """Read a durable receipt and current archive/summary state without file APIs."""
         validate_key(idempotency_key)
@@ -1420,36 +1376,7 @@ class Session:
         )
         try:
             await self._resolve_pending_commit_receipts()
-            entry = await self._commit_receipts.get(idempotency_key)
-            if entry is None:
-                raise NotFoundError("Commit receipt not found")
-            receipt = entry["result"]
-            archive_uri = receipt.get("archive_uri")
-            state = "skipped" if not archive_uri else "pending"
-            failure = None
-            overview = ""
-            if archive_uri:
-                for name, terminal in ((".done", "completed"), (".failed.json", "failed")):
-                    try:
-                        marker = json.loads(
-                            await self._viking_fs.read_file(f"{archive_uri}/{name}", ctx=self.ctx)
-                        )
-                    except Exception as exc:
-                        if not _is_storage_not_found(exc):
-                            raise
-                    else:
-                        state = terminal
-                        if terminal == "failed":
-                            failure = marker
-                        break
-                overview = await self._archives.read_overview(archive_uri)
-            return {
-                "receipt": receipt,
-                "archive_state": state,
-                "summary_ready": state == "completed" and bool(overview),
-                "overview": overview if state == "completed" else "",
-                "failure": failure,
-            }
+            return await self._commit_receipts.status(idempotency_key, self._archives)
         finally:
             await self._viking_fs._async_agfs.pathlock_release(lease)
 
@@ -1748,10 +1675,7 @@ class Session:
                 )
                 await self._save_meta()
                 if reset_context:
-                    if idempotency_key is not None:
-                        await self._publish_keyed_reset(result["reset_archive_uri"])
-                    else:
-                        await self._append_context_reset_archive()
+                    await self._append_context_reset_archive(result.get("reset_archive_uri"))
                 get_current_telemetry().set("memory.extracted", 0)
                 if idempotency_key is not None:
                     await self._commit_receipts.save(
@@ -1913,9 +1837,6 @@ class Session:
                     )
 
                 phase1_stage = "phase1_persist"
-                await self._source_index.index_archive(
-                    archive_uri, messages_to_archive, self._meta.commit_count
-                )
                 self._messages = retained_messages
                 await self._write_to_agfs_async(messages=self._messages)
                 self._meta.message_count = len(self._messages)
@@ -1964,11 +1885,6 @@ class Session:
                             self.session_id,
                             exc_info=True,
                         )
-                if reset_context:
-                    if idempotency_key is not None:
-                        await self._publish_keyed_reset(result["reset_archive_uri"])
-                    else:
-                        await self._append_context_reset_archive()
             except Exception as e:
                 logger.error(f"[commit] Failed during {phase1_stage}: {e}")
                 # Whether the queue write failed or a queued Phase 1 stopped
@@ -2002,6 +1918,8 @@ class Session:
                         )
                     publication_lease = None
                 raise
+            if reset_context:
+                await self._append_context_reset_archive(result.get("reset_archive_uri"))
             if idempotency_key is not None:
                 await self._commit_receipts.save(
                     idempotency_key, request_hash, result, finished=True
@@ -2077,23 +1995,37 @@ class Session:
 
         return result
 
-    async def _append_context_reset_archive(self) -> None:
-        """Publish a boundary archive while holding the Phase 1 session lock.
-
-        The directory holds only ``.done``: terminal archives never have their
-        ``messages.jsonl`` read, and a missing overview already reads as empty.
-        """
-        # ponytail: reuse archive ordering; no second session identity or context store.
-        newest = f"{self._session_uri}/history/archive_{self._compression.compression_index:03d}"
-        if (
-            self._compression.compression_index > 0
-            and await self._archives.is_context_reset_archive(newest)
-        ):
-            return  # Context is already empty; no second boundary needed.
-        self._compression.compression_index += 1
-        archive_uri = (
-            f"{self._session_uri}/history/archive_{self._compression.compression_index:03d}"
-        )
+    async def _append_context_reset_archive(self, archive_uri: Optional[str] = None) -> None:
+        """Publish a boundary under the session lock, reusing a reserved URI on retry."""
+        reserved = archive_uri is not None
+        if reserved:
+            # Recovery may start on a stale Session object; merge fresh metadata.
+            try:
+                content = await self._viking_fs.read_file(
+                    f"{self._session_uri}/.meta.json", ctx=self.ctx
+                )
+                self._meta = SessionMeta.from_dict(json.loads(content))
+            except Exception as exc:
+                if not _is_storage_not_found(exc):
+                    raise
+            self._compression.compression_index = max(
+                self._compression.compression_index,
+                self._meta.commit_count,
+                self._archives.archive_index_from_uri(archive_uri),
+            )
+        else:
+            newest = (
+                f"{self._session_uri}/history/archive_{self._compression.compression_index:03d}"
+            )
+            if (
+                self._compression.compression_index > 0
+                and await self._archives.is_context_reset_archive(newest)
+            ):
+                return  # Context is already empty; no second boundary needed.
+            self._compression.compression_index += 1
+            archive_uri = (
+                f"{self._session_uri}/history/archive_{self._compression.compression_index:03d}"
+            )
         try:
             await self._viking_fs.write_file(
                 f"{archive_uri}/.done",
@@ -2101,9 +2033,10 @@ class Session:
                 ctx=self.ctx,
             )
         except Exception as exc:
-            # A directory left without any marker reads as pending and would
-            # block the next Phase 2 forever; no queue owns this archive.
-            await self._write_failed_marker(archive_uri, stage="context_reset", error=str(exc))
+            # Keyed attempts retain their reservation for recovery. An unkeyed
+            # boundary has no retry owner and must not leave a pending archive.
+            if not reserved:
+                await self._write_failed_marker(archive_uri, stage="context_reset", error=str(exc))
             raise
         self._meta.commit_count = self._compression.compression_index
         await self._save_meta()
