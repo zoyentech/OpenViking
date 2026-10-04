@@ -215,14 +215,16 @@ class ArchiveStore:
                 continue
         return "pending"
 
-    async def list_refs(self) -> List[Dict[str, Any]]:
+    async def list_refs(self, *, strict: bool = False) -> List[Dict[str, Any]]:
         """List archive refs sorted by archive index descending."""
         if not self._viking_fs:
             return []
 
         try:
             history_items = await self._viking_fs.ls(f"{self._session_uri}/history", ctx=self._ctx)
-        except Exception:
+        except Exception as exc:
+            if strict and not is_storage_not_found(exc):
+                raise
             return []
 
         refs: List[Dict[str, Any]] = []

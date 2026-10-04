@@ -420,6 +420,7 @@ class SessionService:
         min_raw_tail_steps: Optional[int] = None,
         event_tags: Optional[List[str]] = None,
         reset_context: bool = False,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Commit a session (archive messages and extract memories).
 
@@ -443,6 +444,7 @@ class SessionService:
             min_raw_tail_steps=min_raw_tail_steps,
             event_tags=event_tags,
             reset_context=reset_context,
+            idempotency_key=idempotency_key,
         )
 
     async def commit_async(
@@ -458,6 +460,7 @@ class SessionService:
         min_raw_tail_steps: Optional[int] = None,
         event_tags: Optional[List[str]] = None,
         reset_context: bool = False,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Async commit a session.
 
@@ -490,6 +493,8 @@ class SessionService:
             commit_kwargs["event_tags"] = event_tags
         if reset_context:
             commit_kwargs["reset_context"] = True
+        if idempotency_key is not None:
+            commit_kwargs["idempotency_key"] = idempotency_key
         result = await session.commit_async(**commit_kwargs)
         self._record_lifecycle_metric("commit", "ok" if result.get("status") else "error")
         self._record_archive_metric("ok" if result.get("archived") else "skip")

@@ -17,6 +17,57 @@ Session API 按认证用户作用域访问会话，并返回 canonical user sess
 
 ## API 参考
 
+### 消息写入与 commit 重试
+
+`POST /api/v1/sessions/{session_id}/messages` 和 `/messages/batch` 的非空
+`source_message_ids` 标识一条原始输入。重复发送相同 ID 集合和相同内容时，服务端返回
+原来的 `message_ids`，不会重复追加；此行为跨 commit、保留窗口、reset 和进程重启生效。
+`added` 表示本次新增的物理消息数，全部重复时为 `0`。一条工具结果聚合输入可能对应多条
+物理消息。
+
+```json
+{"messages": [{"role": "user", "content": "记住这条信息", "source_message_ids": ["upstream-message-123"]}]}
+```
+
+比较内容包括 role、parts、peer、turn、message_kind 和显式提供的创建时间，不包括服务端
+生成的 ID/时间；source ID 顺序不影响结果。同 ID 改内容或 ID 集合部分重叠返回
+`409 CONFLICT`，整个 batch 不追加消息。每条输入最多 100 个不同的非空白 source ID，
+每个最多 256 字符。未提供 ID 或提供空列表的消息维持普通追加行为，混合 batch 也一样。
+`message_kind="checkpoint"` 的 source IDs 用于累计来源引用，不参与投递去重。
+功能发布前的历史消息没有原始输入指纹，重用其非 checkpoint source ID 会返回 `409`，
+不会猜测内容是否相同；客户端应为新消息使用新的 source ID。
+
+`POST /api/v1/sessions/{session_id}/commit` 新增可选 `idempotency_key`：
+
+```json
+{"idempotency_key": "commit-request-456", "keep_recent_count": 0}
+```
+
+超时后使用相同 key 和参数重试，会返回原来的 task_id、archive_uri、trace_id 及保留窗口
+结果，即使期间有新消息，也不会再次切归档。skipped 提交和 `reset_context` 同样适用；
+带 key 的 reset 额外返回 `reset_archive_uri`。相同 key 改参数返回 `409`。
+key 是最多 256 字符的非空白字符串，保留到 session 删除，作用域是当前认证的
+account/user/session，API key 轮换不改变作用域，telemetry 不参与请求内容比较。
+
+```http
+GET /api/v1/sessions/{session_id}/commit-status?idempotency_key=commit-request-456
+```
+
+该接口沿用 session 认证，返回 `receipt`、`archive_state`（pending/completed/failed/skipped）、
+`summary_ready`、已完成的 `overview` 和 `failure` 详情。未知 key 返回 `404`。
+回执不依赖可能过期的 task 记录；客户端无需读取内部文件或预测归档名。
+关闭 working memory 生成时，归档完成仍可能为 `summary_ready=false`。
+
+Phase 1 中断后，下一次写消息、commit 重试或状态查询会在原 session 锁内恢复。
+若持久化 root 证明归档发布已完成，且 QueueFS 工作存在，则完成原回执；否则该次回执变为
+`status="failed"`、`reason="interrupted_phase1"`，相同 key 继续返回该次尝试。
+确认状态后才应主动用新 key 发起新尝试。恢复不会按消息计数猜测并删除无关消息。
+
+幂等保证限于消息接收与 commit/归档身份，不代表 Phase 2 记忆提取及外部副作用 exactly-once。
+回执和可重建的 source→archive 索引采用整份 JSON，元数据开销随 session 历史线性增长。
+首次索引从历史构建，正常重试只读取命中归档原文；权威数据缺失或损坏时拒绝猜测去重结果。
+客户端需要使用包含该功能的服务端版本；旧服务端可能忽略新的 commit 请求字段。
+
 ### create_session()
 
 #### 1. API 实现介绍

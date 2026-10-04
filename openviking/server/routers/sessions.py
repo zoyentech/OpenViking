@@ -597,6 +597,7 @@ class CommitRequest(BaseModel):
         default=None,
         description="Override only Working Memory generation for this commit; null inherits policy.",
     )
+    idempotency_key: Optional[str] = Field(default=None, min_length=1, max_length=256)
     reset_context: bool = Field(
         default=False,
         strict=True,
@@ -689,6 +690,8 @@ async def commit_session(
     )
     if body.reset_context:
         commit_kwargs["reset_context"] = True
+    if body.idempotency_key is not None:
+        commit_kwargs["idempotency_key"] = body.idempotency_key
     event_tags = _commit_event_tags(body.extraction_metadata)
     if event_tags is not None:
         commit_kwargs["event_tags"] = event_tags
@@ -706,6 +709,17 @@ async def commit_session(
         result=execution.result,
         telemetry=execution.telemetry,
     ).model_dump(exclude_none=True)
+
+
+@router.post("/{session_id}/extract")
+async def extract_session(
+    session_id: str = Path(..., description="Session ID"),
+    _ctx: RequestContext = Depends(get_session_request_context),
+):
+    """Extract memories from a session."""
+    service = get_service()
+    result = await service.sessions.extract(session_id, _ctx)
+    return Response(status="ok", result=_to_jsonable(result))
 
 
 @router.post("/{session_id}/messages")
@@ -748,9 +762,9 @@ async def add_message(
         ]
         add_many_async = getattr(session, "add_messages_async", None)
         if callable(add_many_async):
-            await add_many_async(specs)
+            messages = await add_many_async(specs)
         else:
-            session.add_messages(specs)
+            messages = session.add_messages(specs)
         await service.sessions.maybe_schedule_auto_commit(
             session_id,
             _ctx,
@@ -760,6 +774,8 @@ async def add_message(
         return {
             "session_id": session_id,
             "message_count": len(session.messages),
+            "message_ids": [message.id for message in messages],
+            "added": getattr(messages, "added", len(messages)),
             # Post-write value so a commit policy can decide without a
             # follow-up get_session round trip.
             "pending_tokens": _session_pending_tokens(session),
@@ -816,7 +832,8 @@ async def batch_add_messages(
         return {
             "session_id": session_id,
             "message_count": len(session.messages),
-            "added": len(msgs),
+            "added": getattr(msgs, "added", len(msgs)),
+            "message_ids": [message.id for message in msgs],
             # Post-write value so a commit policy can decide without a
             # follow-up get_session round trip.
             "pending_tokens": _session_pending_tokens(session),

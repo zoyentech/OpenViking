@@ -58,6 +58,16 @@ from openviking.session.extraction_batch import (
     plan_extraction_batches,
     resolve_extraction_batch_limits,
 )
+from openviking.session.idempotency import (
+    CommitReceipts,
+    MessageWriteResult,
+    SourceMessageIndex,
+    delivery_source_ids,
+    fingerprint,
+    select_message_groups,
+    validate_key,
+    validate_source_ids,
+)
 from openviking.session.memory.constants import AGENT_EVOLUTION_MEMORY_TYPES
 from openviking.session.memory.utils.language import resolve_output_language_from_conversation
 from openviking.session.memory_policy import MemoryPolicy
@@ -475,6 +485,10 @@ class Session:
         self._auto_commit_threshold = auto_commit_threshold
         self._session_uri = session_uri or canonical_session_uri(self.ctx, self.session_id)
         self._archives = ArchiveStore(self._viking_fs, self.ctx, self._session_uri)
+        self._commit_receipts = CommitReceipts(self._viking_fs, self.ctx, self._session_uri)
+        self._source_index = SourceMessageIndex(
+            self._viking_fs, self.ctx, self._session_uri, self._archives
+        )
         self._checkpoints = CheckpointPlanner(self._archives)
         self._tool_outputs = ToolOutputExternalizer(
             self._viking_fs, self._session_uri, self.session_id, self.ctx
@@ -763,30 +777,57 @@ class Session:
             role == "user" and len(parts) > 1 and all(isinstance(part, ToolPart) for part in parts)
         )
 
-    async def _append_messages_authoritatively(self, messages: List[Message]) -> None:
-        """Reload and append under the session path lock.
+    async def _append_messages_authoritatively(
+        self, groups: List[List[Message]]
+    ) -> List[Message]:
+        """Deduplicate by source ID and persist under the shared Session lock.
 
-        Different workers can hold stale Session objects. Without sharing the
-        commit lock, an append between commit's root read and root rewrite can
-        be overwritten even though add_message already returned successfully.
+        The lock spans archive-history lookup and the live append, so separate
+        workers sharing this OpenViking storage cannot both pass the source-ID
+        check and append the same message.
         """
-        if not messages:
-            if self._viking_fs:
-                await self.load()
-            return
+        if not groups:
+            return MessageWriteResult([], added=0)
         if not self._viking_fs:
+            new_groups, result = select_message_groups(groups, self._messages)
+            for group in new_groups:
+                await self._tool_outputs.externalize_group(
+                    group, self._tool_output_externalization_config
+                )
+            messages = [message for group in new_groups for message in group]
             await self._apply_appended_messages_to_state(messages)
-            return
+            return MessageWriteResult(result, added=len(messages))
 
         snapshot: Optional[SessionExpirySnapshot] = None
         snapshot_error: Optional[Exception] = None
         async with self._state_lock("messages.jsonl", ".meta.json") as lease:
             content = await self._reload()
+            await self._resolve_pending_commit_receipts()
+            source_ids = {
+                source_id for group in groups for source_id in delivery_source_ids(group[0])
+            }
+            archived = (
+                await self._source_index.lookup(source_ids, self._meta.commit_count)
+                if source_ids
+                else []
+            )
+            new_groups, result = select_message_groups(groups, archived + self._messages)
+            messages: List[Message] = []
+            for group in new_groups:
+                await self._tool_outputs.externalize_group(
+                    group, self._tool_output_externalization_config
+                )
+                messages.extend(group)
+
+            # Rebuild counters from persisted state after response loss or a
+            # stale Session handle. A replay with no additions remains a no-op.
+            await self._rebuild_pending_tokens()
+            self._meta.message_count = len(self._messages)
+            if not messages:
+                return MessageWriteResult(result, added=0)
+
             await self._apply_appended_messages_to_state(messages)
             batch_content = "".join(message.to_jsonl() + "\n" for message in messages)
-            # Preserve existing JSONL verbatim, as append_file did. Existing
-            # content is already stored bytes; only initial creation used the
-            # text-write privacy transformation.
             persisted_content = (
                 batch_content if content is None else (content + batch_content).encode("utf-8")
             )
@@ -800,7 +841,6 @@ class Session:
             self._loaded = True
             if self._expiry_reporter is not None:
                 try:
-                    # Report only the state persisted under the Session lock.
                     snapshot = self._build_expiry_snapshot_locked()
                 except Exception as exc:
                     snapshot_error = exc
@@ -809,6 +849,7 @@ class Session:
                 await self._expiry_reporter.report_after_append(snapshot)
             else:
                 self._expiry_reporter.record_report_failure("snapshot_build_failed", snapshot_error)
+        return MessageWriteResult(result, added=len(messages))
 
     def _build_expiry_snapshot_locked(self) -> SessionExpirySnapshot:
         if not self._meta.last_message_at:
@@ -865,11 +906,17 @@ class Session:
             if "parts" not in spec:
                 raise ValueError(f"messages_spec[{i}]: missing required key 'parts'")
             role = spec["role"]
-            parts = spec["parts"]
+            # Externalization mutates parts. Keep the caller's retry payload
+            # unchanged, including for embedded clients reusing one spec.
+            parts = copy.deepcopy(spec["parts"])
             created_at = spec.get("created_at") or datetime.now(timezone.utc).isoformat()
             turn_id = spec.get("turn_id")
             message_kind = spec.get("message_kind")
-            source_message_ids = spec.get("source_message_ids")
+            source_message_ids = (
+                spec.get("source_message_ids")
+                if message_kind == "checkpoint"
+                else validate_source_ids(spec.get("source_message_ids"))
+            )
 
             try:
                 peer_id = normalize_peer_id(spec.get("peer_id"))
@@ -910,6 +957,26 @@ class Session:
                 )
                 message_groups.append([msg])
 
+            if source_message_ids and message_kind != "checkpoint":
+                # Use the input before splitting/externalization and exclude
+                # generated IDs/timestamps. Explicit timestamps are semantic.
+                payload = Message(id="", role=role, parts=parts, peer_id=peer_id).to_dict()
+                payload.pop("id")
+                payload["created_at"] = spec.get("created_at")
+                payload["turn_id"] = turn_id
+                payload["message_kind"] = message_kind
+                payload["source_message_ids"] = sorted(source_message_ids)
+                group = message_groups[-1]
+                group_id = group[0].id
+                payload_hash = fingerprint(payload)
+                for index, message in enumerate(group):
+                    message.source_message_identity = {
+                        "payload_hash": payload_hash,
+                        "group_id": group_id,
+                        "group_size": len(group),
+                        "group_index": index,
+                    }
+
         return message_groups
 
     def add_messages(
@@ -925,14 +992,7 @@ class Session:
     ) -> List[Message]:
         """Asynchronously add multiple messages without blocking the caller loop."""
         message_groups = self._build_message_groups(messages_spec)
-        messages = []
-        for group in message_groups:
-            await self._tool_outputs.externalize_group(
-                group, self._tool_output_externalization_config
-            )
-            messages.extend(group)
-        await self._append_messages_authoritatively(messages)
-        return messages
+        return await self._append_messages_authoritatively(message_groups)
 
     def add_message(
         self,
@@ -1185,95 +1245,211 @@ class Session:
             session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
         )
         try:
-            marker = await self._read_phase1_meta(archive_uri)
-            if marker.get("status") == "ready":
-                return True
-            if await self._archives.file_exists(archive_uri, ".failed.json"):
-                return False
+            return await self._recover_phase1_ready_locked(archive_uri)
+        finally:
+            await self._viking_fs._async_agfs.pathlock_release(lease)
 
-            queue_message = marker.get("queue_message")
-            task_id = queue_message.get("task_id") if isinstance(queue_message, dict) else None
-            from openviking.service.task_tracker import get_task_tracker
-
-            tracker = get_task_tracker()
-            if not task_id or not await tracker.has_work(str(task_id)):
-                error = "Phase 1 has no QueueFS work to resume"
-                await self._write_failed_marker(
-                    archive_uri,
-                    stage="phase1_recovery",
-                    error=error,
-                )
-                if task_id:
-                    await tracker.fail(
-                        str(task_id),
-                        error,
-                        account_id=self.ctx.account_id,
-                        user_id=self.ctx.user.user_id,
-                    )
-                return False
-
-            try:
-                if not marker:
-                    raise ValueError("Phase 1 metadata is missing")
-                retained_ids = marker.get("retained_message_ids")
-                archived_ids = marker.get("archived_message_ids")
-                if not isinstance(retained_ids, list) or not isinstance(archived_ids, list):
-                    raise ValueError("Phase 1 metadata has invalid message ID lists")
-                retained_ids = [item for item in retained_ids if isinstance(item, str)]
-                archived_ids = [item for item in archived_ids if isinstance(item, str)]
-                live_messages = await self._read_live_messages_strict()
-            except Exception as exc:
-                await self._write_failed_marker(
-                    archive_uri,
-                    stage="phase1_recovery",
-                    error=f"Cannot verify Phase 1 state: {exc}",
-                )
-                return False
-
-            live_ids = [message.id for message in live_messages]
-            archived_only_ids = set(archived_ids) - set(retained_ids)
-            phase1_applied = live_ids[
-                : len(retained_ids)
-            ] == retained_ids and not archived_only_ids.intersection(live_ids)
-            if not phase1_applied:
-                await self._write_failed_marker(
-                    archive_uri,
-                    stage="phase1_recovery",
-                    error="Root rewrite was not durably completed before process interruption",
-                )
-                return False
-
-            # Root is authoritative and proves the rewrite completed. Reconcile
-            # metadata that may have been interrupted immediately afterwards.
-            try:
-                meta_content = await self._viking_fs.read_file(
-                    f"{self._session_uri}/.meta.json",
-                    ctx=self.ctx,
-                )
-                self._meta = SessionMeta.from_dict(json.loads(meta_content))
-            except Exception:
-                pass
-            self._messages = live_messages
-            self._remember_retention_policy(
-                keep_recent_count=max(0, int(marker.get("keep_recent_count", 0) or 0)),
-                retention_mode=str(marker.get("retention_mode", "") or "") or None,
-                keep_recent_turn_count=max(0, int(marker.get("keep_recent_turn_count", 0) or 0)),
-                retained_message_token_budget=max(
-                    0, int(marker.get("retained_message_token_budget", 0) or 0)
-                ),
-                min_raw_tail_steps=max(0, int(marker.get("min_raw_tail_steps", 1) or 0)),
-            )
-            self._meta.message_count = len(live_messages)
-            self._meta.commit_count = max(
-                self._meta.commit_count,
-                self._archives.archive_index_from_uri(archive_uri),
-            )
-            self._meta.last_commit_at = get_current_timestamp()
-            await self._rebuild_pending_tokens()
-            await self._save_meta()
-            await self._write_phase1_ready_marker(archive_uri)
-            logger.warning("Recovered interrupted Session Phase 1: %s", archive_uri)
+    async def _recover_phase1_ready_locked(self, archive_uri: str) -> bool:
+        """Recover a Phase 1 while the caller holds the session path lock."""
+        marker = await self._read_phase1_meta(archive_uri)
+        if marker.get("status") == "ready":
             return True
+        if await self._archives.file_exists(archive_uri, ".failed.json"):
+            return False
+
+        queue_message = marker.get("queue_message")
+        task_id = queue_message.get("task_id") if isinstance(queue_message, dict) else None
+        from openviking.service.task_tracker import get_task_tracker
+
+        tracker = get_task_tracker()
+        if not task_id or not await tracker.has_work(str(task_id)):
+            error = "Phase 1 has no QueueFS work to resume"
+            await self._write_failed_marker(
+                archive_uri,
+                stage="phase1_recovery",
+                error=error,
+            )
+            if task_id:
+                await tracker.fail(
+                    str(task_id),
+                    error,
+                    account_id=self.ctx.account_id,
+                    user_id=self.ctx.user.user_id,
+                )
+            return False
+
+        try:
+            if not marker:
+                raise ValueError("Phase 1 metadata is missing")
+            retained_ids = marker.get("retained_message_ids")
+            archived_ids = marker.get("archived_message_ids")
+            if not isinstance(retained_ids, list) or not isinstance(archived_ids, list):
+                raise ValueError("Phase 1 metadata has invalid message ID lists")
+            retained_ids = [item for item in retained_ids if isinstance(item, str)]
+            archived_ids = [item for item in archived_ids if isinstance(item, str)]
+            live_messages = await self._read_live_messages_strict()
+        except Exception as exc:
+            await self._write_failed_marker(
+                archive_uri,
+                stage="phase1_recovery",
+                error=f"Cannot verify Phase 1 state: {exc}",
+            )
+            return False
+
+        live_ids = [message.id for message in live_messages]
+        archived_only_ids = set(archived_ids) - set(retained_ids)
+        phase1_applied = live_ids[
+            : len(retained_ids)
+        ] == retained_ids and not archived_only_ids.intersection(live_ids)
+        if not phase1_applied:
+            await self._write_failed_marker(
+                archive_uri,
+                stage="phase1_recovery",
+                error="Root rewrite was not durably completed before process interruption",
+            )
+            return False
+
+        # Root is authoritative and proves the rewrite completed. Reconcile
+        # metadata that may have been interrupted immediately afterwards.
+        try:
+            meta_content = await self._viking_fs.read_file(
+                f"{self._session_uri}/.meta.json",
+                ctx=self.ctx,
+            )
+            self._meta = SessionMeta.from_dict(json.loads(meta_content))
+        except Exception:
+            pass
+        self._messages = live_messages
+        self._remember_retention_policy(
+            keep_recent_count=max(0, int(marker.get("keep_recent_count", 0) or 0)),
+            retention_mode=str(marker.get("retention_mode", "") or "") or None,
+            keep_recent_turn_count=max(0, int(marker.get("keep_recent_turn_count", 0) or 0)),
+            retained_message_token_budget=max(
+                0, int(marker.get("retained_message_token_budget", 0) or 0)
+            ),
+            min_raw_tail_steps=max(0, int(marker.get("min_raw_tail_steps", 1) or 0)),
+        )
+        self._meta.message_count = len(live_messages)
+        self._meta.commit_count = max(
+            self._meta.commit_count,
+            self._archives.archive_index_from_uri(archive_uri),
+        )
+        self._meta.last_commit_at = get_current_timestamp()
+        await self._rebuild_pending_tokens()
+        await self._save_meta()
+        await self._write_phase1_ready_marker(archive_uri)
+        logger.warning("Recovered interrupted Session Phase 1: %s", archive_uri)
+        return True
+
+    async def _resolve_pending_commit_receipts(self) -> None:
+        """Finish or fail interrupted reservations under the session path lock.
+
+        A reservation cannot belong to an active Phase 1 writer while we hold
+        this lock. Reuse the existing recovery proof; never resnapshot messages
+        or enqueue a second job for the same key.
+        """
+        entries = await self._commit_receipts.read()
+        changed = False
+        for entry in entries.values():
+            if entry["finished"]:
+                continue
+            result = entry["result"]
+            archive_uri = result.get("archive_uri")
+            ready = True
+            if archive_uri:
+                try:
+                    raw_meta = await self._viking_fs.read_file(
+                        f"{archive_uri}/.meta.json", ctx=self.ctx
+                    )
+                    marker = json.loads(raw_meta).get("phase1")
+                except Exception as exc:
+                    if not _is_storage_not_found(exc):
+                        raise
+                    marker = None
+                if marker:
+                    ready = await self._recover_phase1_ready_locked(archive_uri)
+                else:
+                    ready = False
+                    await self._write_failed_marker(
+                        archive_uri,
+                        stage="phase1_recovery",
+                        error="Commit interrupted before Phase 1 intent was durable",
+                    )
+            if ready:
+                if result.get("reset_archive_uri"):
+                    await self._publish_keyed_reset(result["reset_archive_uri"])
+            else:
+                result = {
+                    **result,
+                    "status": "failed",
+                    "archived": False,
+                    "reason": "interrupted_phase1",
+                }
+            entry.update(result=result, finished=True)
+            changed = True
+        if changed:
+            await self._commit_receipts.write(entries)
+
+    async def _publish_keyed_reset(self, archive_uri: str) -> None:
+        """Publish the boundary reserved by a keyed commit, exactly at that URI."""
+        await self._viking_fs.write_file(
+            f"{archive_uri}/.done",
+            json.dumps({"context_reset": True, "working_memory_enabled": False}),
+            ctx=self.ctx,
+        )
+        # Reload before merging: a retry must not overwrite concurrent metadata.
+        try:
+            content = await self._viking_fs.read_file(
+                f"{self._session_uri}/.meta.json", ctx=self.ctx
+            )
+            self._meta = SessionMeta.from_dict(json.loads(content))
+        except Exception as exc:
+            if not _is_storage_not_found(exc):
+                raise
+        index = self._archives.archive_index_from_uri(archive_uri)
+        self._meta.commit_count = max(self._meta.commit_count, index)
+        self._compression.compression_index = max(self._compression.compression_index, index)
+        await self._save_meta()
+
+    async def get_commit_status(self, idempotency_key: str) -> Dict[str, Any]:
+        """Read a durable receipt and current archive/summary state without file APIs."""
+        validate_key(idempotency_key)
+        session_path = self._viking_fs._uri_to_path(self._session_uri, ctx=self.ctx)
+        lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(
+            session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
+        )
+        try:
+            await self._resolve_pending_commit_receipts()
+            entry = await self._commit_receipts.get(idempotency_key)
+            if entry is None:
+                raise NotFoundError("Commit receipt not found")
+            receipt = entry["result"]
+            archive_uri = receipt.get("archive_uri")
+            state = "skipped" if not archive_uri else "pending"
+            failure = None
+            overview = ""
+            if archive_uri:
+                for name, terminal in ((".done", "completed"), (".failed.json", "failed")):
+                    try:
+                        marker = json.loads(
+                            await self._viking_fs.read_file(f"{archive_uri}/{name}", ctx=self.ctx)
+                        )
+                    except Exception as exc:
+                        if not _is_storage_not_found(exc):
+                            raise
+                    else:
+                        state = terminal
+                        if terminal == "failed":
+                            failure = marker
+                        break
+                overview = await self._archives.read_overview(archive_uri)
+            return {
+                "receipt": receipt,
+                "archive_state": state,
+                "summary_ready": state == "completed" and bool(overview),
+                "overview": overview if state == "completed" else "",
+                "failure": failure,
+            }
         finally:
             await self._viking_fs._async_agfs.pathlock_release(lease)
 
@@ -1317,6 +1493,7 @@ class Session:
         record_idle_commit_success: bool = False,
         event_tags: Optional[List[str]] = None,
         reset_context: bool = False,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Archive immediately and enqueue restart-safe Phase 2 processing.
 
@@ -1357,6 +1534,24 @@ class Session:
         from openviking.service.task_tracker import get_task_tracker
         from openviking.storage.queuefs import QueueManager, get_queue_manager
         from openviking.storage.queuefs.session_commit_msg import SessionCommitMsg
+
+        request_hash = None
+        if idempotency_key is not None:
+            validate_key(idempotency_key)
+            request_hash = fingerprint(
+                {
+                    "keep_recent_count": keep_recent_count,
+                    "memory_policy": memory_policy,
+                    "retention_mode": retention_mode,
+                    "keep_recent_turn_count": keep_recent_turn_count,
+                    "retained_message_token_budget": retained_message_token_budget,
+                    "min_raw_tail_steps": min_raw_tail_steps,
+                    "persist_keep_recent_count": persist_keep_recent_count,
+                    "record_auto_commit_success": record_auto_commit_success,
+                    "event_tags": event_tags,
+                    "reset_context": reset_context,
+                }
+            )
 
         if reset_context and (keep_recent_count != 0 or retention_mode is not None):
             raise ValueError("reset_context requires keep_recent_count=0 and no retention_mode")
@@ -1431,6 +1626,32 @@ class Session:
         )
         publication_lease: Optional[Any] = None
         try:
+            await self._resolve_pending_commit_receipts()
+            if idempotency_key is not None:
+                previous = await self._commit_receipts.get(idempotency_key, request_hash)
+                if previous is not None:
+                    return previous["result"]
+            agent_evolution_enabled = self._agent_evolution_enabled
+            if self._agent_evolution_enabled_provider is not None:
+                provided_enabled = self._agent_evolution_enabled_provider()
+                agent_evolution_enabled = (
+                    await provided_enabled
+                    if inspect.isawaitable(provided_enabled)
+                    else provided_enabled
+                )
+            if memory_policy is not None:
+                effective_policy = await self._resolve_memory_policy(memory_policy)
+                _validate_memory_policy_types(effective_policy)
+                effective_policy = _apply_agent_evolution_setting(
+                    effective_policy,
+                    agent_evolution_enabled=agent_evolution_enabled,
+                )
+                effective_memory_policy = effective_policy.to_dict()
+                effective_memory_types = sorted(_effective_memory_types(effective_policy))
+                agent_memory_skip_reason = _agent_memory_skip_reason(
+                    agent_evolution_enabled=agent_evolution_enabled,
+                    effective_memory_types=set(effective_memory_types),
+                )
             self._messages = await self._read_live_messages_strict()
             await self._load_meta()
             if (
@@ -1493,6 +1714,30 @@ class Session:
                 self._compression.compression_index += 1
 
             if not self._messages:
+                result = {
+                    "session_id": self.session_id,
+                    "status": "skipped",
+                    "task_id": None,
+                    "archive_uri": None,
+                    "archived": False,
+                    "reason": "no_messages",
+                    "trace_id": trace_id,
+                    "effective_enable_working_memory": effective_policy.enable_working_memory,
+                    **({"reset_context": True} if reset_context else {}),
+                }
+
+                if reset_context and idempotency_key is not None:
+                    newest = f"{self._session_uri}/history/archive_{self._compression.compression_index:03d}"
+                    reset_index = self._compression.compression_index
+                    if not await self._archives.is_context_reset_archive(newest):
+                        reset_index += 1
+                    result["reset_archive_uri"] = (
+                        f"{self._session_uri}/history/archive_{reset_index:03d}"
+                    )
+                if idempotency_key is not None:
+                    await self._commit_receipts.save(
+                        idempotency_key, request_hash, result, finished=False
+                    )
                 self._meta.pending_tokens = 0
                 self._remember_retention_policy(
                     keep_recent_count=stored_keep_recent_count,
@@ -1503,19 +1748,16 @@ class Session:
                 )
                 await self._save_meta()
                 if reset_context:
-                    await self._append_context_reset_archive()
+                    if idempotency_key is not None:
+                        await self._publish_keyed_reset(result["reset_archive_uri"])
+                    else:
+                        await self._append_context_reset_archive()
                 get_current_telemetry().set("memory.extracted", 0)
-                return {
-                    "session_id": self.session_id,
-                    "status": "skipped",
-                    "task_id": None,
-                    "archive_uri": None,
-                    "archived": False,
-                    "effective_enable_working_memory": effective_policy.enable_working_memory,
-                    "reason": "no_messages",
-                    "trace_id": trace_id,
-                    **({"reset_context": True} if reset_context else {}),
-                }
+                if idempotency_key is not None:
+                    await self._commit_receipts.save(
+                        idempotency_key, request_hash, result, finished=True
+                    )
+                return result
 
             total = len(self._messages)
             retention_plan: Optional[RetentionPlan] = None
@@ -1546,6 +1788,25 @@ class Session:
             # No archive work: persist possible Turn-wide externalization and
             # remember the policy for subsequent add_message accounting.
             if not messages_to_archive:
+                result = {
+                    "session_id": self.session_id,
+                    "status": "skipped",
+                    "task_id": None,
+                    "archive_uri": None,
+                    "archived": False,
+                    "reason": "all_within_keep_window",
+                    "trace_id": trace_id,
+                    "effective_enable_working_memory": effective_policy.enable_working_memory,
+                    "estimated_active_tokens": (
+                        retention_plan.estimated_active_tokens if retention_plan else 0
+                    ),
+                    "budget_exceeded": retention_plan.budget_exceeded if retention_plan else False,
+                }
+
+                if idempotency_key is not None:
+                    await self._commit_receipts.save(
+                        idempotency_key, request_hash, result, finished=False
+                    )
                 self._messages = retained_messages
                 await self._write_to_agfs_async(messages=self._messages)
                 self._meta.pending_tokens = 0
@@ -1559,20 +1820,11 @@ class Session:
                 )
                 await self._save_meta()
                 get_current_telemetry().set("memory.extracted", 0)
-                return {
-                    "session_id": self.session_id,
-                    "status": "skipped",
-                    "task_id": None,
-                    "archive_uri": None,
-                    "archived": False,
-                    "effective_enable_working_memory": effective_policy.enable_working_memory,
-                    "reason": "all_within_keep_window",
-                    "trace_id": trace_id,
-                    "estimated_active_tokens": (
-                        retention_plan.estimated_active_tokens if retention_plan else 0
-                    ),
-                    "budget_exceeded": retention_plan.budget_exceeded if retention_plan else False,
-                }
+                if idempotency_key is not None:
+                    await self._commit_receipts.save(
+                        idempotency_key, request_hash, result, finished=True
+                    )
+                return result
 
             self._compression.compression_index += 1
             archive_uri = (
@@ -1591,6 +1843,28 @@ class Session:
                 event_search_tags=list(effective_event_tags),
                 auto_commit_policy=dict(self._meta.auto_commit_policy or {}),
             )
+            result = {
+                "session_id": self.session_id,
+                "status": "accepted",
+                "task_id": task_id,
+                "archive_uri": archive_uri,
+                "archived": True,
+                "trace_id": trace_id,
+                "effective_enable_working_memory": effective_policy.enable_working_memory,
+                **({"reset_context": True} if reset_context else {}),
+                "estimated_active_tokens": (
+                    retention_plan.estimated_active_tokens if retention_plan else 0
+                ),
+                "budget_exceeded": retention_plan.budget_exceeded if retention_plan else False,
+            }
+            if reset_context and idempotency_key is not None:
+                result["reset_archive_uri"] = (
+                    f"{self._session_uri}/history/archive_{self._compression.compression_index + 1:03d}"
+                )
+            if idempotency_key is not None:
+                await self._commit_receipts.save(
+                    idempotency_key, request_hash, result, finished=False
+                )
             phase1_stage = "phase1_persist"
             try:
                 archive_persist_tasks = [
@@ -1622,9 +1896,9 @@ class Session:
                     *archive_persist_tasks,
                     return_exceptions=True,
                 )
-                for result in archive_persist_results:
-                    if isinstance(result, BaseException):
-                        raise result
+                for persist_result in archive_persist_results:
+                    if isinstance(persist_result, BaseException):
+                        raise persist_result
                 if retention_plan is not None:
                     await self._merge_archive_meta(
                         archive_uri,
@@ -1639,6 +1913,9 @@ class Session:
                     )
 
                 phase1_stage = "phase1_persist"
+                await self._source_index.index_archive(
+                    archive_uri, messages_to_archive, self._meta.commit_count
+                )
                 self._messages = retained_messages
                 await self._write_to_agfs_async(messages=self._messages)
                 self._meta.message_count = len(self._messages)
@@ -1688,23 +1965,31 @@ class Session:
                             exc_info=True,
                         )
                 if reset_context:
-                    await self._append_context_reset_archive()
+                    if idempotency_key is not None:
+                        await self._publish_keyed_reset(result["reset_archive_uri"])
+                    else:
+                        await self._append_context_reset_archive()
             except Exception as e:
                 logger.error(f"[commit] Failed during {phase1_stage}: {e}")
                 # Whether the queue write failed or a queued Phase 1 stopped
                 # before publication, a terminal marker makes archive raw
                 # logically live and prevents a permanent pending directory.
-                try:
-                    await self._write_failed_marker(
-                        archive_uri,
-                        stage=phase1_stage,
-                        error=str(e),
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to mark archive after Phase 1 persistence failure: %s",
-                        archive_uri,
-                    )
+                if idempotency_key is None:
+                    try:
+                        await self._write_failed_marker(
+                            archive_uri,
+                            stage=phase1_stage,
+                            error=str(e),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to mark archive after Phase 1 persistence failure: %s",
+                            archive_uri,
+                        )
+                # A keyed write may have succeeded before its storage response
+                # was lost. Leave its reservation for the same recovery proof
+                # used after a process crash; do not prematurely mark a
+                # durably rewritten root as a failed commit.
                 self._messages = original_messages
                 self._compression.compression_index -= 1
                 if publication_lease is not None:
@@ -1717,6 +2002,10 @@ class Session:
                         )
                     publication_lease = None
                 raise
+            if idempotency_key is not None:
+                await self._commit_receipts.save(
+                    idempotency_key, request_hash, result, finished=True
+                )
         finally:
             await self._viking_fs._async_agfs.pathlock_release(lease)
         # Lock released; Phase 1 intent, retained root, metadata and ready
@@ -1786,20 +2075,7 @@ class Session:
                     )
                 publication_lease = None
 
-        return {
-            "session_id": self.session_id,
-            "status": "accepted",
-            "task_id": task_id,
-            "archive_uri": archive_uri,
-            "archived": True,
-            "effective_enable_working_memory": effective_policy.enable_working_memory,
-            "trace_id": trace_id,
-            **({"reset_context": True} if reset_context else {}),
-            "estimated_active_tokens": (
-                retention_plan.estimated_active_tokens if retention_plan else 0
-            ),
-            "budget_exceeded": retention_plan.budget_exceeded if retention_plan else False,
-        }
+        return result
 
     async def _append_context_reset_archive(self) -> None:
         """Publish a boundary archive while holding the Phase 1 session lock.

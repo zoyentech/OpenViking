@@ -17,6 +17,74 @@ session URIs. URI-based APIs may also accept the backward-compatible
 
 ## API Reference
 
+### Retrying message writes and commits
+
+For `POST /api/v1/sessions/{session_id}/messages` and `/messages/batch`, a
+nonempty `source_message_ids` list identifies one original input payload. Repeating
+the same source ID set and payload returns the original `message_ids`, including
+after commit, retention, reset, or a server restart. The response `added` counts
+new physical messages; a fully duplicated batch returns `0`. Tool-result aggregates
+can produce several physical message IDs for one input.
+
+```json
+{"messages": [{"role": "user", "content": "Remember this", "source_message_ids": ["upstream-message-123"]}]}
+```
+
+The server compares role, parts, peer, turn, message kind, and an explicitly supplied
+creation time. Generated IDs and generated timestamps are excluded; source ID order
+does not matter. Reusing an ID with another payload or a partially overlapping ID
+set returns HTTP `409 CONFLICT`, before appending any message in that batch. Each
+input accepts up to 100 distinct, nonblank source IDs of at most 256 characters.
+
+Messages with no IDs (or an empty list) retain ordinary append semantics, including
+inside mixed batches. `message_kind="checkpoint"` uses `source_message_ids` as
+cumulative provenance and is also excluded from delivery deduplication. Historical
+messages written before this feature lack the original input fingerprint; reuse of
+their non-checkpoint source IDs returns `409` rather than silently guessing whether
+the payload matches. Clients should start with fresh source IDs for new messages.
+
+`POST /api/v1/sessions/{session_id}/commit` accepts an optional `idempotency_key`:
+
+```json
+{"idempotency_key": "commit-request-456", "keep_recent_count": 0}
+```
+
+Use the same key and parameters after a timeout. The server returns the original
+receipt (`task_id`, `archive_uri`, `trace_id`, retention results), without cutting
+another archive, even if new messages have arrived. This includes skipped commits
+and `reset_context`; keyed resets additionally return `reset_archive_uri`. Changing
+commit parameters with the same key returns HTTP `409`. Keys are nonblank strings
+of at most 256 characters and live until the session is deleted. They are scoped to
+the authenticated account, user, and session; rotating an API key does not change
+that scope. Telemetry options are not part of the commit payload identity.
+
+```http
+GET /api/v1/sessions/{session_id}/commit-status?idempotency_key=commit-request-456
+```
+
+This authenticated endpoint returns `receipt`, `archive_state` (`pending`,
+`completed`, `failed`, or `skipped`), `summary_ready`, the completed `overview`, and
+`failure` details. An unknown key returns `404`. Receipt lookup is independent of
+task-record expiry, so clients do not need to inspect storage files or predict
+archive names. A completed archive can have `summary_ready=false` when working
+memory generation was disabled.
+
+An interrupted Phase 1 is resolved under the existing session lock on the next
+write, commit retry, or status query. If the persisted root proves the archive
+publication completed and QueueFS work exists, recovery finishes the original
+receipt. Otherwise the receipt becomes `status="failed"` with
+`reason="interrupted_phase1"`; the same key continues to return that attempt. Read
+its status before deliberately starting a new attempt with a new key. Recovery
+never reconstructs or deletes unrelated messages based on a message count.
+
+The guarantee covers message acceptance and commit/archive identity. It does not
+make Phase 2 memory extraction or its external side effects exactly once. Receipt
+metadata and the rebuildable source-to-archive index are whole JSON files whose
+size grows with the session. Normal retries read only matching archive raw files;
+the index is initially built from history, and missing/corrupt authoritative data
+fails closed. These APIs require a server version containing this feature; older
+servers may ignore the new commit request field.
+
 ### create_session()
 
 #### 1. API Implementation Introduction

@@ -8,7 +8,7 @@ Message = role + parts, supports serialization to JSONL.
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from openviking.core.peer_id import normalize_peer_id
 from openviking.message.part import ContextPart, ImagePart, Part, TextPart, ToolPart, part_from_dict
@@ -29,6 +29,9 @@ class Message:
         Literal["user_query", "assistant_step", "tool_transport", "checkpoint"]
     ] = None
     source_message_ids: Optional[List[str]] = None
+    # Server-generated identity of the original input, before tool splitting or
+    # externalization. Kept with the message across every archive boundary.
+    source_message_identity: Optional[Dict[str, Any]] = None
 
     @property
     def content(self) -> str:
@@ -94,6 +97,8 @@ class Message:
             data["message_kind"] = self.message_kind
         if self.source_message_ids is not None:
             data["source_message_ids"] = list(self.source_message_ids)
+        if self.source_message_identity is not None:
+            data["source_message_identity"] = dict(self.source_message_identity)
         return data
 
     def _part_to_dict(self, part: Part) -> dict:
@@ -198,6 +203,7 @@ class Message:
                 if isinstance(data.get("source_message_ids"), list)
                 else None
             ),
+            source_message_identity=data.get("source_message_identity"),
         )
 
     def to_jsonl(self) -> str:
