@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from openviking.message import Message
 from openviking.session.archive_store import is_storage_not_found
-from openviking_cli.exceptions import ConflictError, InvalidArgumentError, NotFoundError
+from openviking_cli.exceptions import ConflictError, InvalidArgumentError
 
 COMMIT_RECEIPT_LIMIT = 8
 
@@ -174,35 +174,3 @@ class CommitReceipts:
             "finished": finished,
         }
         await self.write(entries)
-
-    async def status(self, key: str, archives: Any) -> Dict[str, Any]:
-        """Expose a retained receipt and summary without internal file names."""
-        entry = await self.get(key)
-        if entry is None:
-            raise NotFoundError("Commit receipt not found or outside the retry window")
-        receipt = entry["result"]
-        archive_uri = receipt.get("archive_uri")
-        state = "pending" if archive_uri else "skipped"
-        failure, overview = None, ""
-        if archive_uri:
-            for name, terminal in ((".done", "completed"), (".failed.json", "failed")):
-                try:
-                    marker = json.loads(
-                        await self.fs.read_file(f"{archive_uri}/{name}", ctx=self.ctx)
-                    )
-                except Exception as exc:
-                    if not is_storage_not_found(exc):
-                        raise
-                else:
-                    state = terminal
-                    if terminal == "failed":
-                        failure = marker
-                    break
-            overview = await archives.read_overview(archive_uri)
-        return {
-            "receipt": receipt,
-            "archive_state": state,
-            "summary_ready": state == "completed" and bool(overview),
-            "overview": overview if state == "completed" else "",
-            "failure": failure,
-        }

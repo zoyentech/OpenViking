@@ -1367,19 +1367,6 @@ class Session:
         if changed:
             await self._commit_receipts.write(entries)
 
-    async def get_commit_status(self, idempotency_key: str) -> Dict[str, Any]:
-        """Read a durable receipt and current archive/summary state without file APIs."""
-        validate_key(idempotency_key)
-        session_path = self._viking_fs._uri_to_path(self._session_uri, ctx=self.ctx)
-        lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(
-            session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
-        )
-        try:
-            await self._resolve_pending_commit_receipts()
-            return await self._commit_receipts.status(idempotency_key, self._archives)
-        finally:
-            await self._viking_fs._async_agfs.pathlock_release(lease)
-
     def commit(
         self,
         keep_recent_count: int = 0,

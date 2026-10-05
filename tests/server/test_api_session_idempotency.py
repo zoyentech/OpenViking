@@ -50,12 +50,6 @@ async def test_message_and_commit_http_retry_contract(client):
         base + "/commit", json={"idempotency_key": "request-one", "keep_recent_count": 1}
     )
     assert changed.status_code == 409, changed.text
-    status = await client.get(base + "/commit-status", params={"idempotency_key": "request-one"})
-    assert status.status_code == 200, status.text
-    assert status.json()["result"]["receipt"] == receipt
-    assert status.json()["result"]["archive_state"] in {"pending", "completed"}
-    missing = await client.get(base + "/commit-status", params={"idempotency_key": "unknown"})
-    assert missing.status_code == 404, missing.text
     current = await client.get(base)
     assert current.json()["result"]["message_count"] == 1
 
@@ -73,10 +67,8 @@ async def test_message_and_commit_http_retry_contract(client):
     for index in range(3, 10):
         newer = await client.post(base + "/commit", json={"idempotency_key": f"request-{index}"})
         assert newer.status_code == 200, newer.text
-    expired = await client.get(base + "/commit-status", params={"idempotency_key": "request-one"})
-    assert expired.status_code == 404, expired.text
-    newest = await client.get(base + "/commit-status", params={"idempotency_key": "request-9"})
-    assert newest.status_code == 200, newest.text
+    replayed = await client.post(base + "/commit", json={"idempotency_key": "request-9"})
+    assert replayed.json()["result"] == newer.json()["result"]
     added = await client.post(base + "/messages", json={"role": "user", "content": "after expiry"})
     assert added.status_code == 200, added.text
     restarted = await client.post(base + "/commit", json={"idempotency_key": "request-one"})

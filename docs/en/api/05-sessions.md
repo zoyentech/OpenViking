@@ -66,27 +66,16 @@ retrying a key does not refresh its position. An unfinished Phase 1 reservation
 cannot be evicted: it is resolved under the session lock before another commit
 starts. Keys are scoped to the authenticated account, user, and session; rotating
 an API key does not change that scope. Telemetry options are not part of the commit
-payload identity.
-
-```http
-GET /api/v1/sessions/{session_id}/commit-status?idempotency_key=commit-request-456
-```
-
-This authenticated endpoint returns `receipt`, `archive_state` (`pending`,
-`completed`, `failed`, or `skipped`), `summary_ready`, the completed `overview`, and
-`failure` details. An unknown or evicted key returns `404`. Posting an evicted key
-starts a new attempt, so clients must not retry keys indefinitely. Receipt lookup
-within this window is independent of task-record expiry; clients do not need to
-inspect storage files or predict
-archive names. A completed archive can have `summary_ready=false` when working
-memory generation was disabled.
+payload identity. Posting an evicted key starts a new attempt, so clients must
+not retry keys indefinitely. Follow Phase 2 progress with the receipt's `task_id`
+through `GET /api/v1/tasks/{task_id}`.
 
 An interrupted Phase 1 is resolved under the existing session lock on the next
-write, commit retry, or status query. If the persisted root proves the archive
+write or commit retry. If the persisted root proves the archive
 publication completed and QueueFS work exists, recovery finishes the original
 receipt. Otherwise the receipt becomes `status="failed"` with
-`reason="interrupted_phase1"`; the same key continues to return that attempt. Read
-its status before deliberately starting a new attempt with a new key. Recovery
+`reason="interrupted_phase1"`; the same key continues to return that attempt.
+Inspect that receipt before deliberately starting a new attempt with a new key. Recovery
 never reconstructs or deletes unrelated messages based on a message count.
 
 The guarantee covers message acceptance and commit/archive identity. It does not

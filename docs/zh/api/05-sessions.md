@@ -54,22 +54,13 @@ Session API 按认证用户作用域访问会话，并返回 canonical user sess
 key 是最多 256 字符的非空白字符串，只保留按首次写入顺序排列的最近 **8 次尝试**，
 重试不会延长保留位置。未完成的 Phase 1 预留不能被淘汰，新的 commit 开始前必须先在
 会话锁内恢复旧预留。作用域是当前认证的 account/user/session，API key 轮换不改变作用域，
-telemetry 不参与请求内容比较。
+telemetry 不参与请求内容比较。重新 POST 已淘汰的 key 会发起新尝试，因此不能无限期重试旧 key。
+Phase 2 进度可用回执中的 `task_id` 通过 `GET /api/v1/tasks/{task_id}` 查询。
 
-```http
-GET /api/v1/sessions/{session_id}/commit-status?idempotency_key=commit-request-456
-```
-
-该接口沿用 session 认证，返回 `receipt`、`archive_state`（pending/completed/failed/skipped）、
-`summary_ready`、已完成的 `overview` 和 `failure` 详情。未知或已淘汰的 key 返回 `404`；
-重新 POST 已淘汰的 key 会发起新尝试，因此不能无限期重试旧 key。窗口内的回执不依赖
-可能过期的 task 记录；客户端无需读取内部文件或预测归档名。
-关闭 working memory 生成时，归档完成仍可能为 `summary_ready=false`。
-
-Phase 1 中断后，下一次写消息、commit 重试或状态查询会在原 session 锁内恢复。
+Phase 1 中断后，下一次写消息或 commit 重试会在原 session 锁内恢复。
 若持久化 root 证明归档发布已完成，且 QueueFS 工作存在，则完成原回执；否则该次回执变为
 `status="failed"`、`reason="interrupted_phase1"`，相同 key 继续返回该次尝试。
-确认状态后才应主动用新 key 发起新尝试。恢复不会按消息计数猜测并删除无关消息。
+确认该回执后才应主动用新 key 发起新尝试。恢复不会按消息计数猜测并删除无关消息。
 
 幂等保证限于消息接收与 commit/归档身份，不代表 Phase 2 记忆提取及外部副作用 exactly-once。
 不维护全历史 source 索引。消息去重读取已有的 live 文件与最近一份原文归档；commit

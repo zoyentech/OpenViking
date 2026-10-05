@@ -14,7 +14,7 @@ import pytest
 from openviking.message import Message, TextPart, ToolPart
 from openviking.server.identity import RequestContext, Role
 from openviking.session.session import Session
-from openviking_cli.exceptions import ConflictError, NotFoundError
+from openviking_cli.exceptions import ConflictError
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -322,10 +322,8 @@ async def test_concurrent_commit_receipts_survive_later_messages_and_key_rotatio
     assert [message.id for message in check.messages] == [later[0].id]
     with pytest.raises(ConflictError):
         await new().commit_async(idempotency_key="commit-1", keep_recent_count=1)
-    with pytest.raises(NotFoundError):
-        await new(user="bob").get_commit_status("commit-1")
-    with pytest.raises(NotFoundError):
-        await new(account="other").get_commit_status("commit-1")
+    assert await new(user="bob")._commit_receipts.get("commit-1") is None
+    assert await new(account="other")._commit_receipts.get("commit-1") is None
 
 
 @pytest.mark.asyncio
@@ -355,10 +353,9 @@ async def test_commit_receipts_keep_eight_and_expired_key_starts_new_attempt(env
             # first-write order before the ninth reservation is created.
             assert await new().commit_async(idempotency_key="commit-0") == receipts[0]
     assert len(await new()._commit_receipts.read()) == 8
-    with pytest.raises(NotFoundError):
-        await new().get_commit_status("commit-0")
+    assert await new()._commit_receipts.get("commit-0") is None
     for index in range(1, 9):
-        assert (await new().get_commit_status(f"commit-{index}"))["receipt"] == receipts[index]
+        assert (await new()._commit_receipts.get(f"commit-{index}"))["result"] == receipts[index]
 
     await new().add_messages_async([spec("new content after key expired", None)])
     restarted = await new().commit_async(idempotency_key="commit-0")
@@ -367,8 +364,7 @@ async def test_commit_receipts_keep_eight_and_expired_key_starts_new_attempt(env
     assert restarted["archive_uri"] != receipts[0]["archive_uri"]
     assert len(jobs) == 10
     assert len(await new()._commit_receipts.read()) == 8
-    with pytest.raises(NotFoundError):
-        await new().get_commit_status("commit-1")
+    assert await new()._commit_receipts.get("commit-1") is None
 
 
 @pytest.mark.asyncio
@@ -428,9 +424,8 @@ async def test_new_key_resolves_old_reservation_under_lock_before_capacity_evict
     assert observed == [True]
     assert len(jobs) == 8
     assert len(await session._commit_receipts.read()) == 8
-    assert (await session.get_commit_status("unfinished"))["receipt"]["status"] == "accepted"
-    with pytest.raises(NotFoundError):
-        await session.get_commit_status("finished-0")
+    assert (await session._commit_receipts.get("unfinished"))["result"]["status"] == "accepted"
+    assert await session._commit_receipts.get("finished-0") is None
 
 
 def crash_point(stage, after):
@@ -476,9 +471,10 @@ async def test_commit_process_crash_never_recuts_or_loses_messages(env, stage, a
     assert recovered["status"] in {"accepted", "failed"}
     assert len(jobs) <= 1
     assert await new().commit_async(idempotency_key="crash", reset_context=True) == recovered
-    state = await new().get_commit_status("crash")
     if recovered["status"] == "failed":
-        assert state["archive_state"] == "failed"
+        archive_uri = recovered["archive_uri"]
+        assert await store.exists(f"{archive_uri}/.failed.json", ctx=session.ctx)
+        assert not await store.exists(f"{archive_uri}/.done", ctx=session.ctx)
     else:
         assert recovered["reset_archive_uri"].endswith("archive_002")
     # Union of durable raw files always contains all original IDs, including
@@ -512,24 +508,6 @@ async def test_storage_response_lost_after_apply_recovers_success(env, stage):
     assert result["archived"]
     assert len(jobs) == 1
     assert result["archive_uri"] == jobs[0]["archive_uri"]
-
-
-@pytest.mark.asyncio
-async def test_status_returns_summary_and_durable_receipt_without_task_tracker(env):
-    store, _, new = env
-    session = new()
-    await session.add_messages_async([spec()])
-    receipt = await session.commit_async(idempotency_key="status")
-    assert not (await new().get_commit_status("status"))["summary_ready"]
-    await store.write_file(f"{receipt['archive_uri']}/.done", "{}", ctx=session.ctx)
-    await store.write_file(
-        f"{receipt['archive_uri']}/.overview.md", "# Context\nremember this", ctx=session.ctx
-    )
-    state = await new().get_commit_status("status")
-    assert state["receipt"] == receipt
-    assert state["archive_state"] == "completed"
-    assert state["summary_ready"]
-    assert "remember this" in state["overview"]
 
 
 @pytest.mark.asyncio
@@ -674,11 +652,6 @@ async def test_real_router_and_service_http_contract(env, monkeypatch):
             base + "/commit", json={"idempotency_key": "key", "keep_recent_count": 1}
         )
         assert conflict.status_code == 409, conflict.text
-        status = await client.get(base + "/commit-status", params={"idempotency_key": "key"})
-        assert status.status_code == 200, status.text
-        assert status.json()["result"]["receipt"] == commit.json()["result"]
-        missing = await client.get(base + "/commit-status", params={"idempotency_key": "missing"})
-        assert missing.status_code == 404, missing.text
 
         # Eight newer commit attempts evict the original key even when they
         # skipped an empty session; retry access does not extend its lifetime.
@@ -686,8 +659,6 @@ async def test_real_router_and_service_http_contract(env, monkeypatch):
             newer = await client.post(base + "/commit", json={"idempotency_key": f"newer-{index}"})
             assert newer.status_code == 200, newer.text
             assert newer.json()["result"]["status"] == "skipped"
-        expired = await client.get(base + "/commit-status", params={"idempotency_key": "key"})
-        assert expired.status_code == 404, expired.text
         added = await client.post(
             base + "/messages", json={"role": "user", "content": "after expiry"}
         )
