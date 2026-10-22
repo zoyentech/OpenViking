@@ -4,7 +4,7 @@
 -- before service_name was introduced. If the existing rows belong to a deployment
 -- whose configured service_name is not 'openviking-server', replace that literal
 -- consistently before running this script. For a custom table prefix, replace
--- ov_tasks consistently in all table, index, and constraint names.
+-- ov_tasks consistently in all table and index names.
 
 ALTER TABLE `ov_tasks_works`
     DROP FOREIGN KEY fk_ov_tasks_works_task;
@@ -80,10 +80,6 @@ ALTER TABLE `ov_tasks_works`
     DROP INDEX ix_ov_tasks_works_owner,
     DROP PRIMARY KEY,
     ADD PRIMARY KEY (service_name, task_id, work_id),
-    ADD CONSTRAINT fk_ov_tasks_works_task
-        FOREIGN KEY (service_name, task_id)
-        REFERENCES `ov_tasks` (service_name, task_id)
-        ON DELETE CASCADE,
     ADD KEY ix_ov_tasks_works_state
         (service_name, task_id, state),
     ADD KEY ix_ov_tasks_works_queue
@@ -93,8 +89,4 @@ ALTER TABLE `ov_tasks_works`
 
 ALTER TABLE `ov_tasks_execution_events`
     DROP PRIMARY KEY,
-    ADD PRIMARY KEY (service_name, task_id, seq),
-    ADD CONSTRAINT fk_ov_tasks_execution_events_task
-        FOREIGN KEY (service_name, task_id)
-        REFERENCES `ov_tasks` (service_name, task_id)
-        ON DELETE CASCADE;
+    ADD PRIMARY KEY (service_name, task_id, seq);

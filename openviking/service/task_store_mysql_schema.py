@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from sqlalchemy import Boolean, ForeignKeyConstraint, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.mysql import DOUBLE, JSON
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -166,12 +166,6 @@ def make_task_store_models(table_prefix: str = "ov_tasks") -> TaskStoreModels:
     class Work(Base):
         __tablename__ = work_table
         __table_args__ = (
-            ForeignKeyConstraint(
-                ["service_name", "task_id"],
-                [f"{table_prefix}.service_name", f"{table_prefix}.task_id"],
-                ondelete="CASCADE",
-                name=f"fk_{work_table}_task",
-            ),
             Index(
                 f"ix_{work_table}_state",
                 "service_name",
@@ -218,12 +212,6 @@ def make_task_store_models(table_prefix: str = "ov_tasks") -> TaskStoreModels:
     class Event(Base):
         __tablename__ = event_table
         __table_args__ = (
-            ForeignKeyConstraint(
-                ["service_name", "task_id"],
-                [f"{table_prefix}.service_name", f"{table_prefix}.task_id"],
-                ondelete="CASCADE",
-                name=f"fk_{event_table}_task",
-            ),
             {
                 "mysql_engine": "InnoDB",
                 "mysql_charset": "utf8mb4",
