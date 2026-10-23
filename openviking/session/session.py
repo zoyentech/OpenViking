@@ -1316,6 +1316,46 @@ class Session:
             if lease is not None:
                 await self._viking_fs._async_agfs.pathlock_release(lease)
 
+    async def _ensure_commit_task_published(self, queue_message: Dict[str, Any]) -> None:
+        """Restore the durable Phase 2 task when a response was lost before enqueue."""
+        task_id = str(queue_message.get("task_id") or "")
+        if not task_id:
+            raise ValueError("Phase 1 queue message has no task_id")
+        from openviking.service.task_tracker import get_task_tracker
+        from openviking.storage.queuefs import QueueManager, get_queue_manager
+        from openviking.service.task_work_index import bind_task_context
+
+        tracker = get_task_tracker()
+        archive_uri = str(queue_message.get("archive_uri") or "")
+        archive_path = self._viking_fs._uri_to_path(archive_uri, ctx=self.ctx)
+        lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(
+            archive_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
+        )
+        try:
+            if await tracker.has_work(
+                task_id, account_id=self.ctx.account_id, user_id=self.ctx.user.user_id
+            ):
+                return
+            task = await tracker.get(
+                task_id, account_id=self.ctx.account_id, user_id=self.ctx.user.user_id
+            )
+            if task is not None and task.status.value in {"completed", "failed", "cancelled"}:
+                return
+            await tracker.create(
+                "session_commit",
+                resource_id=self.session_id,
+                account_id=self.ctx.account_id,
+                user_id=self.ctx.user.user_id,
+                task_id=task_id,
+            )
+            with bind_task_context(task_id, self.ctx.account_id, self.ctx.user.user_id):
+                await get_queue_manager().enqueue(
+                    QueueManager.SESSION_COMMIT,
+                    queue_message,
+                )
+        finally:
+            await self._viking_fs._async_agfs.pathlock_release(lease)
+
     async def _resolve_pending_commit_receipts(self) -> None:
         """Finish or fail interrupted reservations under the session path lock.
 
@@ -1326,10 +1366,26 @@ class Session:
         entries = await self._commit_receipts.read()
         changed = False
         for entry in entries.values():
-            if entry["finished"]:
-                continue
             result = entry["result"]
+            if result.get("status") not in {"accepted", "skipped"}:
+                continue
             archive_uri = result.get("archive_uri")
+            if entry["finished"]:
+                if archive_uri:
+                    try:
+                        raw_meta = await self._viking_fs.read_file(
+                            f"{archive_uri}/.meta.json", ctx=self.ctx
+                        )
+                        phase1 = json.loads(raw_meta).get("phase1")
+                    except Exception as exc:
+                        if not _is_storage_not_found(exc):
+                            raise
+                        phase1 = None
+                    if isinstance(phase1, dict) and phase1.get("status") == "ready":
+                        queue_message = phase1.get("queue_message")
+                        if isinstance(queue_message, dict):
+                            await self._ensure_commit_task_published(queue_message)
+                continue
             ready = True
             if archive_uri:
                 try:
@@ -1342,6 +1398,9 @@ class Session:
                         raise
                     marker = None
                 if marker:
+                    queue_message = marker.get("queue_message")
+                    if isinstance(queue_message, dict):
+                        await self._ensure_commit_task_published(queue_message)
                     ready = await self._ensure_phase1_ready(archive_uri, lock_held=True)
                 else:
                     ready = False
@@ -1910,6 +1969,15 @@ class Session:
                     idempotency_key, request_hash, result, finished=True
                 )
         finally:
+            if publication_lease is not None:
+                try:
+                    await self._viking_fs._async_agfs.pathlock_release(publication_lease)
+                except Exception:
+                    logger.exception(
+                        "Failed to release archive publication lease: %s",
+                        archive_uri,
+                    )
+                publication_lease = None
             await self._viking_fs._async_agfs.pathlock_release(lease)
         # Lock released; Phase 1 intent, retained root, metadata and ready
         # metadata are durable before Task-store or QueueFS latency.

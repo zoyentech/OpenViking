@@ -33,7 +33,9 @@ class Store:
         self.fault_error = ProcessCrash
         self.yield_message_reads = False
         self._async_agfs = SimpleNamespace(
-            pathlock_acquire_exact=self.acquire, pathlock_release=self.release
+            pathlock_acquire_exact=self.acquire,
+            pathlock_acquire_exact_batch=self.acquire_batch,
+            pathlock_release=self.release,
         )
 
     def _uri_to_path(self, uri, ctx=None):
@@ -43,8 +45,16 @@ class Store:
         await self.locks[path].acquire()
         return path
 
+    async def acquire_batch(self, paths, **kwargs):
+        leases = []
+        for path in sorted(paths):
+            leases.append(await self.acquire(path))
+        return leases
+
     async def release(self, lease):
-        self.locks[lease].release()
+        leases = lease if isinstance(lease, list) else [lease]
+        for path in reversed(leases):
+            self.locks[path].release()
 
     def crash(self, operation, uri, content, after):
         if self.fault and self.fault(operation, uri, content, after):
@@ -62,6 +72,8 @@ class Store:
         return content
 
     async def write_file(self, uri, content, ctx=None, lease_ref=None):
+        if isinstance(content, bytes):
+            content = content.decode("utf-8")
         self.writes.append(uri)
         self.crash("write", uri, content, False)
         self.files[self._uri_to_path(uri, ctx)] = content
@@ -110,10 +122,14 @@ def env(monkeypatch):
         jobs.append(message)
         store.crash("enqueue", "queue", message, True)
 
+    async def has_work(task_id, **kwargs):
+        return any(job["task_id"] == task_id for job in jobs)
+
     tracker = SimpleNamespace(
         create=AsyncMock(),
+        get=AsyncMock(return_value=None),
         fail=AsyncMock(),
-        has_work=lambda task_id: any(job["task_id"] == task_id for job in jobs),
+        has_work=has_work,
     )
     monkeypatch.setattr("openviking.session.session._enabled_memory_types", lambda: set())
     monkeypatch.setattr("openviking.service.task_tracker.get_task_tracker", lambda: tracker)
