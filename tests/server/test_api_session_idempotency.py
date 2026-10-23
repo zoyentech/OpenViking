@@ -53,14 +53,14 @@ async def test_message_and_commit_http_retry_contract(client):
     current = await client.get(base)
     assert current.json()["result"]["message_count"] == 1
 
-    # A newer raw archive moves the message retry window past the original
-    # messages, so the same source IDs now identify a new delivery.
+    # Source IDs remain unique across archive rollover, so a delayed retry
+    # still resolves to the original persisted messages.
     latest = await client.post(base + "/commit", json={"idempotency_key": "request-two"})
     assert latest.status_code == 200, latest.text
     outside_window = await client.post(base + "/messages/batch", json=body)
     assert outside_window.status_code == 200, outside_window.text
-    assert outside_window.json()["result"]["added"] == 2
-    assert outside_window.json()["result"]["message_ids"] != first.json()["result"]["message_ids"]
+    assert outside_window.json()["result"]["added"] == 0
+    assert outside_window.json()["result"]["message_ids"] == first.json()["result"]["message_ids"]
 
     # Receipts keep only eight attempts, in first-write order. Both archived
     # and skipped attempts participate in this bound.

@@ -93,13 +93,13 @@ def _install_session_commit_queue_fallback(service: OpenVikingService, monkeypat
     queued_commit_tasks: set[str] = set()
     tracker = get_task_tracker()
     original_has_work = tracker.has_work
-    monkeypatch.setattr(
-        tracker,
-        "has_work",
-        lambda task_id, **kwargs: (
-            task_id in queued_commit_tasks or original_has_work(task_id, **kwargs)
-        ),
-    )
+
+    async def has_work(task_id, **kwargs):
+        if task_id in queued_commit_tasks:
+            return True
+        return await original_has_work(task_id, **kwargs)
+
+    monkeypatch.setattr(tracker, "has_work", has_work)
 
     async def enqueue_with_session_commit_fallback(queue_name, data):
         if queue_name != QueueManager.SESSION_COMMIT:
@@ -190,6 +190,9 @@ def upload_temp_dir(temp_dir: Path, monkeypatch) -> Path:
 @pytest_asyncio.fixture(scope="function")
 async def service(temp_dir: Path, monkeypatch):
     """Create and initialize an OpenVikingService for in-process API tests."""
+    config_path = temp_dir / "ov.conf"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("OPENVIKING_CONFIG_FILE", str(config_path))
     fake_embedder_cls = _install_fake_embedder(monkeypatch)
     _install_fake_vlm(monkeypatch)
     svc = OpenVikingService(
