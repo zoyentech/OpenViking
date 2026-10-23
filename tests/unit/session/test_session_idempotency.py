@@ -31,6 +31,7 @@ class Store:
         self.listings = 0
         self.fault = None
         self.fault_error = ProcessCrash
+        self.yield_message_reads = False
         self._async_agfs = SimpleNamespace(
             pathlock_acquire_exact=self.acquire, pathlock_release=self.release
         )
@@ -55,7 +56,10 @@ class Store:
         path = self._uri_to_path(uri, ctx)
         if path not in self.files:
             raise FileNotFoundError(uri)
-        return self.files[path]
+        content = self.files[path]
+        if self.yield_message_reads and uri.endswith("/messages.jsonl"):
+            await asyncio.sleep(0)
+        return content
 
     async def write_file(self, uri, content, ctx=None, lease_ref=None):
         self.writes.append(uri)
@@ -678,9 +682,11 @@ async def test_in_memory_externalization_and_per_call_counts(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_same_session_concurrent_counts_are_receipt_local(env):
-    _, _, new = env
+    store, _, new = env
     session = new()
-    results = await asyncio.gather(*[session.add_messages_async([spec()]) for _ in range(8)])
+    await store.write_file(f"{session.uri}/messages.jsonl", "", ctx=session.ctx)
+    store.yield_message_reads = True
+    results = await asyncio.gather(*[new().add_messages_async([spec()]) for _ in range(8)])
     assert sorted(result.added for result in results) == [0] * 7 + [1]
     assert len({result[0].id for result in results}) == 1
 
