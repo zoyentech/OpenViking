@@ -803,9 +803,7 @@ class Session:
             source_ids = {
                 source_id for group in groups for source_id in delivery_source_ids(group[0])
             }
-            archived = (
-                await self._archives.recent_messages(self._meta.commit_count) if source_ids else []
-            )
+            archived = await self._archives.source_messages(source_ids) if source_ids else []
             new_groups, result = select_message_groups(groups, archived + self._messages)
             messages: List[Message] = []
             for group in new_groups:

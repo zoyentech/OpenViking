@@ -215,25 +215,36 @@ class ArchiveStore:
                 continue
         return "pending"
 
-    async def list_refs(self) -> List[Dict[str, Any]]:
+    async def list_refs(self, *, strict: bool = False) -> List[Dict[str, Any]]:
         """List archive refs sorted by archive index descending."""
         if not self._viking_fs:
             return []
 
         try:
             history_items = await self._viking_fs.ls(f"{self._session_uri}/history", ctx=self._ctx)
-        except Exception:
+        except Exception as exc:
+            if strict and not is_storage_not_found(exc):
+                raise
             return []
 
         refs: List[Dict[str, Any]] = []
+        seen_indices: set[int] = set()
         for item in history_items:
             name = item.get("name") if isinstance(item, dict) else item
-            if not name or not name.startswith("archive_"):
+            if not isinstance(name, str) or not name.startswith("archive_"):
                 continue
             try:
                 index = int(name.split("_")[1])
-            except Exception:
+                if index <= 0 or name != f"archive_{index:03d}":
+                    raise ValueError("invalid archive name")
+                if index in seen_indices:
+                    raise ValueError("duplicate archive index")
+            except (IndexError, TypeError, ValueError) as exc:
+                if strict:
+                    raise ValueError(f"invalid session archive entry: {name!r}") from exc
                 continue
+
+            seen_indices.add(index)
 
             refs.append(
                 {
@@ -244,6 +255,29 @@ class ArchiveStore:
             )
 
         return sorted(refs, key=lambda item: item["index"], reverse=True)
+
+    async def source_messages(self, source_ids: set[str]) -> List[Message]:
+        """Read archived records that carry any delivery source ID.
+
+        Message retries can outlive any fixed number of commits. Raw archive
+        records retain the source identity, so a keyed append must consult every
+        archive while holding the session path lock. Missing or corrupt archived
+        raw data fails closed rather than accepting an ID that may already exist.
+        """
+        if not source_ids:
+            return []
+
+        matches: List[Message] = []
+        for archive in await self.list_refs(strict=True):
+            archive_uri = archive["archive_uri"]
+            if await self.is_context_reset_archive(archive_uri, strict=True):
+                continue
+            for message in await self.read_messages(archive_uri):
+                if message.message_kind == "checkpoint":
+                    continue
+                if source_ids.intersection(message.source_message_ids or []):
+                    matches.append(message)
+        return matches
 
     async def scan_states(self) -> List[ArchiveState]:
         """Derive every archive state exclusively from its directory markers."""
@@ -379,9 +413,21 @@ class ArchiveStore:
             return {}
         return self.normalize_done(done) if isinstance(done, dict) else {}
 
-    async def is_context_reset_archive(self, archive_uri: str) -> bool:
+    async def is_context_reset_archive(self, archive_uri: str, *, strict: bool = False) -> bool:
         """Return True when the archive's ``.done`` marks a context reset boundary."""
-        return (await self.read_done(archive_uri)).get("context_reset") is True
+        try:
+            content = await self._viking_fs.read_file(f"{archive_uri}/.done", ctx=self._ctx)
+        except Exception as exc:
+            if strict and not is_storage_not_found(exc):
+                raise
+            return False
+        try:
+            done = json.loads(content)
+        except (json.JSONDecodeError, TypeError) as exc:
+            if strict:
+                raise ValueError(f"invalid archive completion marker: {archive_uri}") from exc
+            return False
+        return isinstance(done, dict) and done.get("context_reset") is True
 
     # ------------------------------------------------------------------
     # Sidecar readers

@@ -178,7 +178,7 @@ async def test_payload_conflict_rejects_entire_batch(env, change):
 
 
 @pytest.mark.asyncio
-async def test_message_retry_window_moves_with_latest_raw_archive(env):
+async def test_message_source_ids_remain_idempotent_across_archives(env):
     store, _, new = env
     session = new()
     original = await session.add_messages_async([spec()])
@@ -188,27 +188,139 @@ async def test_message_retry_window_moves_with_latest_raw_archive(env):
     replay = await new().add_messages_async([spec()])
     assert replay.added == 0
     assert replay[0].id == original[0].id
-    assert [
-        uri for uri in store.reads if "/history/" in uri and uri.endswith("/messages.jsonl")
-    ] == [f"{first['archive_uri']}/messages.jsonl"]
+    assert f"{first['archive_uri']}/messages.jsonl" in store.reads
 
     latest = await session.add_messages_async([spec("latest", "latest")])
     second = await session.commit_async()
     store.reads.clear()
-    outside_window = await new().add_messages_async([spec()])
-    assert outside_window.added == 1
-    assert outside_window[0].id != original[0].id
-    assert [
-        uri for uri in store.reads if "/history/" in uri and uri.endswith("/messages.jsonl")
-    ] == [f"{second['archive_uri']}/messages.jsonl"]
+    replay_after_archive = await new().add_messages_async([spec()])
+    assert replay_after_archive.added == 0
+    assert replay_after_archive[0].id == original[0].id
+    assert f"{first['archive_uri']}/messages.jsonl" in store.reads
+    assert f"{second['archive_uri']}/messages.jsonl" in store.reads
     assert (await new().add_messages_async([spec("latest", "latest")]))[0].id == latest[0].id
-    assert store.listings == listings
+    assert store.listings > listings
     assert not any(uri.endswith("/.source-message-index.json") for uri in store.writes)
     assert not any(uri.endswith("/.source-message-index.json") for uri in store.reads)
 
 
 @pytest.mark.asyncio
-async def test_reset_retry_checks_only_boundary_and_its_immediate_predecessor(env):
+async def test_archive_lookup_fails_closed_when_history_listing_is_unavailable(env, monkeypatch):
+    store, _, new = env
+    session = new()
+    original = await session.add_messages_async([spec()])
+    await session.commit_async()
+
+    async def fail_listing(uri, ctx=None):
+        raise OSError("history listing unavailable")
+
+    monkeypatch.setattr(store, "ls", fail_listing)
+    with pytest.raises(OSError, match="history listing unavailable"):
+        await new().add_messages_async([spec()])
+
+    check = new()
+    await check.load()
+    assert not check.messages
+    assert (
+        original[0].id
+        in store.files[
+            store._uri_to_path(f"{session.uri}/history/archive_001/messages.jsonl", session.ctx)
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_archive_lookup_fails_closed_on_malformed_history_entry(env):
+    store, _, new = env
+    session = new()
+    await session.add_messages_async([spec()])
+    await session.commit_async()
+    await store.write_file(
+        f"{session.uri}/history/archive_broken/messages.jsonl",
+        "{}\n",
+        ctx=session.ctx,
+    )
+
+    with pytest.raises(ValueError, match="invalid session archive entry"):
+        await new().add_messages_async([spec()])
+
+    check = new()
+    await check.load()
+    assert not check.messages
+
+
+@pytest.mark.asyncio
+async def test_retry_fails_closed_when_newer_archive_is_corrupt(env):
+    store, _, new = env
+    session = new()
+    original = await session.add_messages_async([spec()])
+    await session.commit_async()
+    await session.add_messages_async([spec("newer", "newer")])
+    newest = await session.commit_async()
+    await store.write_file(
+        f"{newest['archive_uri']}/messages.jsonl", "broken json", ctx=session.ctx
+    )
+
+    with pytest.raises(ValueError, match="invalid message record"):
+        await new().add_messages_async([spec()])
+
+    check = new()
+    await check.load()
+    assert not check.messages
+    older_archive_uri = f"{session.uri}/history/archive_001/messages.jsonl"
+    assert original[0].id in store.files[store._uri_to_path(older_archive_uri, session.ctx)]
+
+
+@pytest.mark.asyncio
+async def test_source_ids_stay_unique_after_multiple_archives_and_concurrent_retries(env):
+    _, _, new = env
+    original = (await new().add_messages_async([spec()]))[0]
+
+    for index in range(1, 4):
+        result = await new().commit_async()
+        assert result["archived"]
+        if index < 3:
+            await new().add_messages_async([spec(f"later-{index}", f"later-{index}")])
+
+    first, second = await asyncio.gather(
+        new().add_messages_async([spec()]),
+        new().add_messages_async([spec()]),
+    )
+
+    assert first.added + second.added == 0
+    assert first[0].id == second[0].id == original.id
+    with pytest.raises(ConflictError):
+        await new().add_messages_async([spec("changed", "source-1")])
+
+
+@pytest.mark.asyncio
+async def test_lost_append_response_remains_idempotent_after_archive_rollover(env):
+    store, _, new = env
+    session = new()
+    root_uri = f"{session.uri}/messages.jsonl"
+
+    def lose_response(operation, uri, content, after):
+        return operation == "write" and uri == root_uri and after
+
+    store.fault = lose_response
+    with pytest.raises(ProcessCrash):
+        await new().add_messages_async([spec()])
+
+    persisted = new()
+    await persisted.load()
+    original_id = persisted.messages[0].id
+    for index in range(1, 4):
+        assert (await new().commit_async())["archived"]
+        if index < 3:
+            await new().add_messages_async([spec(f"later-{index}", f"later-{index}")])
+
+    replay = await new().add_messages_async([spec()])
+    assert replay.added == 0
+    assert replay[0].id == original_id
+
+
+@pytest.mark.asyncio
+async def test_source_ids_remain_idempotent_across_context_reset(env):
     store, _, new = env
     session = new()
     old = await session.add_messages_async([spec("old", "old")])
@@ -216,7 +328,6 @@ async def test_reset_retry_checks_only_boundary_and_its_immediate_predecessor(en
     latest = await session.add_messages_async([spec()])
     reset = await session.commit_async(idempotency_key="reset", reset_context=True)
     store.reads.clear()
-    listings = store.listings
     replay = await new().add_messages_async([spec()])
     assert replay.added == 0
     assert replay[0].id == latest[0].id
@@ -224,21 +335,15 @@ async def test_reset_retry_checks_only_boundary_and_its_immediate_predecessor(en
         uri for uri in store.reads if "/history/" in uri and uri.endswith("/messages.jsonl")
     ]
     assert f"{reset['archive_uri']}/messages.jsonl" in raw_reads
-    assert set(raw_reads) <= {
-        f"{reset['archive_uri']}/messages.jsonl",
-        f"{reset['reset_archive_uri']}/messages.jsonl",
-    }
-    assert len(raw_reads) <= 2
-    assert f"{oldest['archive_uri']}/messages.jsonl" not in store.reads
-    expired = await new().add_messages_async([spec("old", "old")])
-    assert expired.added == 1
-    assert expired[0].id != old[0].id
-    assert store.listings == listings
+    assert f"{oldest['archive_uri']}/messages.jsonl" in store.reads
+    old_replay = await new().add_messages_async([spec("old", "old")])
+    assert old_replay.added == 0
+    assert old_replay[0].id == old[0].id
     assert not any(uri.endswith("/.source-message-index.json") for uri in store.writes)
 
 
 @pytest.mark.asyncio
-async def test_retry_does_not_scan_past_two_consecutive_reset_boundaries(env):
+async def test_retry_scans_prior_archives_past_reset_boundaries(env):
     store, _, new = env
     session = new()
     original = await session.add_messages_async([spec()])
@@ -258,18 +363,13 @@ async def test_retry_does_not_scan_past_two_consecutive_reset_boundaries(env):
     store.reads.clear()
     listings = store.listings
     replay = await new().add_messages_async([spec()])
-    assert replay.added == 1
-    assert replay[0].id != original[0].id
+    assert replay.added == 0
+    assert replay[0].id == original[0].id
     raw_reads = [
         uri for uri in store.reads if "/history/" in uri and uri.endswith("/messages.jsonl")
     ]
-    assert len(raw_reads) <= 2
-    assert f"{first['archive_uri']}/messages.jsonl" not in store.reads
-    assert set(raw_reads) <= {
-        f"{session.uri}/history/archive_002/messages.jsonl",
-        f"{session.uri}/history/archive_003/messages.jsonl",
-    }
-    assert store.listings == listings
+    assert raw_reads == [f"{first['archive_uri']}/messages.jsonl"]
+    assert store.listings > listings
 
 
 @pytest.mark.asyncio
@@ -646,6 +746,12 @@ async def test_real_router_and_service_http_contract(env, monkeypatch):
         assert bad.status_code == 409, bad.text
         commit = await client.post(base + "/commit", json={"idempotency_key": "key"})
         assert commit.status_code == 200, commit.text
+        archived_replay = await client.post(base + "/messages/batch", json=payload)
+        assert archived_replay.status_code == 200, archived_replay.text
+        assert archived_replay.json()["result"]["added"] == 0
+        assert (
+            archived_replay.json()["result"]["message_ids"] == first.json()["result"]["message_ids"]
+        )
         retried = await client.post(base + "/commit", json={"idempotency_key": "key"})
         assert retried.json()["result"] == commit.json()["result"]
         conflict = await client.post(

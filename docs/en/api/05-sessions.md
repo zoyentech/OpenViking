@@ -22,12 +22,13 @@ session URIs. URI-based APIs may also accept the backward-compatible
 For `POST /api/v1/sessions/{session_id}/messages` and `/messages/batch`, a
 nonempty `source_message_ids` list identifies one original input payload. Repeating
 the same source ID set and payload returns the original `message_ids` while the
-input remains in the retry window: current live messages and the most recent
-committed raw archive. A reset adds an empty boundary; in that case only its
-immediate predecessor is also checked. No older archives are searched. The window
-survives a server restart. The response `added` counts new physical messages; a
-fully duplicated batch returns `0`. Tool-result aggregates can produce several
-physical message IDs for one input.
+session exists, including after any number of commits or context resets and across
+server restarts. The response `added` counts new physical messages; a fully
+duplicated batch returns `0`. Tool-result aggregates can produce several physical
+message IDs for one input. The session path lock covers lookup and append, so
+concurrent workers cannot both accept the same source ID. Multi-process and
+multi-replica deployments must configure every worker to use the same shared
+PathLock backend; process-local memory locks do not provide this guarantee.
 
 ```json
 {"messages": [{"role": "user", "content": "Remember this", "source_message_ids": ["upstream-message-123"]}]}
@@ -43,11 +44,14 @@ Messages with no IDs (or an empty list) retain ordinary append semantics, includ
 inside mixed batches. `message_kind="checkpoint"` uses `source_message_ids` as
 cumulative provenance and is also excluded from delivery deduplication. Historical
 messages written before this feature lack the original input fingerprint; reuse of
-their non-checkpoint source IDs within the window returns `409` rather than
-silently guessing whether the payload matches. Once an ID is absent from live
-messages and the most recent archive, sending it again is a new write. Clients
-must finish retrying a batch before advancing through further commits; this is
-timeout recovery, not a way to reimport a session's history without duplicates.
+their non-checkpoint source IDs returns `409` rather than silently guessing whether
+the payload matches. The lookup checks live messages and every raw archive,
+including archives before reset boundaries. Archive listing and raw reads fail
+closed: if the server cannot establish whether an ID already exists, it does not
+append the message. Raw archive history must remain available for the lifetime of
+the session to preserve this guarantee. The lookup scans archived messages, so its
+cost grows with session history. Clients can safely retry a batch after later
+commits; this is timeout recovery, not a way to reimport a session's history.
 
 `POST /api/v1/sessions/{session_id}/commit` accepts an optional `idempotency_key`:
 
@@ -79,12 +83,12 @@ Inspect that receipt before deliberately starting a new attempt with a new key. 
 never reconstructs or deletes unrelated messages based on a message count.
 
 The guarantee covers message acceptance and commit/archive identity. It does not
-make Phase 2 memory extraction or its external side effects exactly once. There
-is no historical source index. Message retries use the existing live file and one
-recent raw archive; commit receipts occupy one JSON file with at most 8 entries.
-Missing/corrupt raw data inside the window fails closed without searching older
-archives. These APIs require a server version containing this feature; older
-servers may ignore the new commit request field.
+make Phase 2 memory extraction or its external side effects exactly once. Message
+source IDs are persisted with their canonical messages and checked under the
+session path lock against live and all raw archive files. Commit receipts occupy
+one JSON file with at most 8 entries. Missing or corrupt source history fails
+closed. These APIs require a server version containing this feature; older servers
+may ignore the new commit request field.
 
 ### create_session()
 
